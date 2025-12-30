@@ -8,6 +8,8 @@ package raft
 
 import (
 	"fmt"
+	"math"
+
 	//	"bytes"
 	"math/rand"
 	"sync"
@@ -23,9 +25,11 @@ import (
 type raftState string
 
 const (
-	leader    raftState = "leader"
-	candidate raftState = "candidate"
-	follower  raftState = "follower"
+	leader           raftState = "leader"
+	candidate        raftState = "candidate"
+	follower         raftState = "follower"
+	heartbeatTimeout           = 100 * time.Millisecond
+	commitTimeout              = 200 * time.Millisecond
 )
 
 type LogEntry struct {
@@ -41,6 +45,7 @@ type Raft struct {
 	persister *tester.Persister   // Object to hold this peer's persisted raftState
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
+	applyCh   chan raftapi.ApplyMsg
 
 	// Persistent states
 	currentTerm int
@@ -224,6 +229,7 @@ func (rf *Raft) sendRequestVoteToAll(args RequestVoteArgs, replies []RequestVote
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
 			if rf.maybeBecomeFollower(replies[i].Term) {
+				rf.beat.Store(true)
 				return
 			}
 			if ok && replies[i].VoteGranted {
@@ -246,22 +252,65 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term         int
+	PrevLogIndex int
+	MatchIndex   int
+	Success      bool
+}
+
+// rejectAppendEntries must be used with lock
+func (rf *Raft) rejectAppendEntries(reply *AppendEntriesReply, idx int) {
+	reply.Term = rf.currentTerm
+	reply.PrevLogIndex = idx
+	reply.MatchIndex = -1
+	reply.Success = false
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	rf.maybeBecomeFollower(args.Term)
+	if rf.maybeBecomeFollower(args.Term) {
+		rf.beat.Store(true)
+	}
+	lastIdx, _ := rf.getLastLogIdxTerm()
 	if args.Term < rf.currentTerm {
-		reply.Term = rf.currentTerm
-		reply.Success = false
+		rf.rejectAppendEntries(reply, lastIdx)
 		return
 	}
 	rf.beat.Store(true)
+	if lastIdx < args.PrevLogIndex {
+		rf.rejectAppendEntries(reply, lastIdx)
+		tester.Annotate(fmt.Sprintf("Server %v", rf.me), "rejects append", "far index")
+		return
+	}
+	if rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+		rf.rejectAppendEntries(reply, args.PrevLogIndex-1)
+		tester.Annotate(fmt.Sprintf("Server %v", rf.me), "rejects append", "incorrect term")
+		return
+	}
+	for i, entry := range args.Entries {
+		if entry.Index > lastIdx {
+			rf.logs = append(rf.logs, args.Entries[i:]...)
+			tester.Annotate(fmt.Sprintf("Server %v", rf.me), "appends", fmt.Sprintf("appends left: %v right: %v", entry.Index, args.Entries[len(args.Entries)-1].Index))
+			break
+		} else if entry.Term != rf.logs[entry.Index].Term {
+			tester.Annotate(fmt.Sprintf("Server %v", rf.me), "appends", fmt.Sprintf("appends left: %v right: %v", entry.Index, args.Entries[len(args.Entries)-1].Index))
+			rf.logs = rf.logs[:entry.Index]
+			rf.logs = append(rf.logs, args.Entries[i:]...)
+			break
+		}
+	}
+	lastIdx, _ = rf.getLastLogIdxTerm()
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = args.LeaderCommit
+		if lastIdx < args.LeaderCommit {
+			rf.commitIndex = lastIdx
+		}
+	}
 	reply.Term = rf.currentTerm
 	reply.Success = true
+	reply.PrevLogIndex = lastIdx
+	reply.MatchIndex = lastIdx
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -269,41 +318,129 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
-func (rf *Raft) startHeartbeatLoop() {
-	defer tester.Annotate(fmt.Sprintf("Server %v", rf.me), "stops beating", "stops beating")
-	for !rf.killed() {
-		for i := range len(rf.peers) {
-			if i == rf.me {
-				continue
-			}
-			rf.mu.Lock()
-			notLeader := rf.state != leader
-			rf.mu.Unlock()
-			if notLeader {
-				return
-			}
-			go func(i int) {
-				rf.mu.Lock()
-				idx := rf.nextIndex[i] - 1
-				term := rf.logs[idx].Term
-				args := AppendEntriesArgs{
-					Term:         rf.currentTerm,
-					Leader:       rf.me,
-					PrevLogIndex: idx,
-					PrevLogTerm:  term,
-					Entries:      rf.logs[idx+1:],
-					LeaderCommit: rf.commitIndex,
-				}
-				reply := AppendEntriesReply{}
-				rf.mu.Unlock()
-				if rf.sendAppendEntries(i, &args, &reply) {
-					rf.mu.Lock()
-					rf.maybeBecomeFollower(reply.Term)
-					rf.mu.Unlock()
-				}
-			}(i)
+// prepareAppendEntries must be used with lock
+func (rf *Raft) prepareAppendEntries(server int) (AppendEntriesArgs, AppendEntriesReply) {
+	idx := rf.nextIndex[server] - 1
+	term := rf.logs[idx].Term
+	args := AppendEntriesArgs{
+		Term:         rf.currentTerm,
+		Leader:       rf.me,
+		PrevLogIndex: idx,
+		PrevLogTerm:  term,
+		Entries:      rf.logs[idx+1:],
+		LeaderCommit: rf.commitIndex,
+	}
+	reply := AppendEntriesReply{}
+	return args, reply
+}
+
+// handleAppendEntriesReply must be used with lock
+func (rf *Raft) handleAppendEntriesReply(server int, reply AppendEntriesReply) {
+	if reply.Term != rf.currentTerm {
+		return
+	}
+	if rf.maybeBecomeFollower(reply.Term) {
+		rf.beat.Store(true)
+	}
+	if reply.Success {
+		tester.Annotate(fmt.Sprintf("Server %v", rf.me), "append successes", fmt.Sprintf("server: %v, next: %v, match: %v", server, reply.PrevLogIndex+1, reply.MatchIndex))
+		if rf.matchIndex[server] < reply.MatchIndex {
+			rf.matchIndex[server] = reply.MatchIndex
+			rf.nextIndex[server] = reply.PrevLogIndex + 1
 		}
-		time.Sleep(100 * time.Millisecond)
+	} else {
+		if rf.matchIndex[server] <= reply.PrevLogIndex && rf.nextIndex[server] >= reply.PrevLogIndex {
+			rf.nextIndex[server] = reply.PrevLogIndex
+		}
+	}
+}
+
+func (rf *Raft) tryAppendEntries(server int) {
+	rf.mu.Lock()
+	args, reply := rf.prepareAppendEntries(server)
+	rf.mu.Unlock()
+	if rf.sendAppendEntries(server, &args, &reply) {
+		rf.mu.Lock()
+		rf.handleAppendEntriesReply(server, reply)
+		rf.mu.Unlock()
+	}
+}
+
+// startAppendEntriesLoop starts the data plane that sends entries in a serialized manner.
+func (rf *Raft) startAppendEntriesLoop(server int) {
+	for !rf.killed() {
+		if _, isLeader := rf.GetState(); isLeader == false {
+			time.Sleep(heartbeatTimeout)
+			continue
+		}
+		now := time.Now()
+		rf.tryAppendEntries(server)
+		delta := time.Since(now)
+		if delta < heartbeatTimeout {
+			time.Sleep(heartbeatTimeout - delta)
+		}
+	}
+}
+
+// startHeartbeatLoop starts the control plane that sends empty args in a parallelized manner.
+//
+// Since rpc.Call is blocking, heartbeat must be sent in parallel so once reconnect, server state can be rebuilt quickly.
+func (rf *Raft) startHeartbeatLoop(server int) {
+	for !rf.killed() {
+		if _, isLeader := rf.GetState(); isLeader {
+			rf.mu.Lock()
+			args := AppendEntriesArgs{Term: rf.currentTerm, Leader: rf.me, PrevLogIndex: math.MaxInt}
+			reply := AppendEntriesReply{}
+			rf.mu.Unlock()
+			go func(args AppendEntriesArgs, reply AppendEntriesReply) {
+				tester.Annotate(fmt.Sprintf("Server %v", rf.me), fmt.Sprintf("beats %v", server), fmt.Sprintf("beats %v", server))
+				rf.sendAppendEntries(server, &args, &reply)
+				rf.mu.Lock()
+				if rf.maybeBecomeFollower(reply.Term) {
+					rf.beat.Store(true)
+				}
+				rf.mu.Unlock()
+			}(args, reply)
+		}
+		time.Sleep(heartbeatTimeout)
+	}
+}
+
+// maybeCommit tries to commit log at idx. It must be used with lock
+func (rf *Raft) maybeCommit(idx int) bool {
+	//tester.Annotate(fmt.Sprintf("Server %v", rf.me), "tries to commit", fmt.Sprintf("tries to commit %d", idx))
+	if rf.logs[idx].Term != rf.currentTerm {
+		return false
+	}
+	majority := len(rf.peers) / 2
+	matches := 0
+	for _, lastIdx := range rf.matchIndex {
+		if lastIdx >= idx {
+			matches++
+		}
+		if matches > majority {
+			rf.commitIndex = idx
+			tester.Annotate(fmt.Sprintf("Server %v", rf.me), "commits", fmt.Sprintf("commits %d", idx))
+			return true
+		}
+	}
+	return false
+}
+
+// startCommitLoop starts an infinite loop that try to commit logs in a timeout
+func (rf *Raft) startCommitLoop() {
+	defer tester.Annotate(fmt.Sprintf("Server %v", rf.me), "stops committing", "stops committing")
+	for !rf.killed() {
+		_, isLeader := rf.GetState()
+		if isLeader {
+			rf.mu.Lock()
+			lastIdx, _ := rf.getLastLogIdxTerm()
+			for i := rf.commitIndex + 1; i <= lastIdx; i++ {
+				rf.maybeCommit(i)
+			}
+			rf.mu.Unlock()
+		}
+		time.Sleep(commitTimeout)
 	}
 }
 
@@ -320,12 +457,18 @@ func (rf *Raft) startHeartbeatLoop() {
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
-	// Your code here (3B).
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	isLeader := rf.state == leader
+	if !isLeader {
+		return -1, -1, false
+	}
+	tester.Annotate(fmt.Sprintf("Server %v", rf.me), "starts", fmt.Sprintf("starts %v", command))
+	lastIdx, _ := rf.getLastLogIdxTerm()
+	rf.logs = append(rf.logs, LogEntry{Data: command, Term: rf.currentTerm, Index: lastIdx + 1})
+	rf.nextIndex[rf.me] = lastIdx + 1
+	rf.matchIndex[rf.me] = rf.nextIndex[rf.me] + 1
+	index, term := rf.getLastLogIdxTerm()
 	return index, term, isLeader
 }
 
@@ -368,7 +511,6 @@ func (rf *Raft) prepareElection() (RequestVoteArgs, []RequestVoteReply) {
 func (rf *Raft) maybeBecomeFollower(term int) bool {
 	if term > rf.currentTerm {
 		tester.Annotate(fmt.Sprintf("Server %v", rf.me), "-> follower", "becomes follower")
-		rf.beat.Store(true)
 		rf.state = follower
 		rf.currentTerm = term
 		rf.votedFor = -1
@@ -389,7 +531,6 @@ func (rf *Raft) becomeLeader() {
 		rf.nextIndex[i] = idx + 1
 		rf.matchIndex[i] = 0
 	}
-	go rf.startHeartbeatLoop()
 }
 
 func (rf *Raft) startElection() {
@@ -418,7 +559,8 @@ func (rf *Raft) startElection() {
 
 func (rf *Raft) startElectionLoop() {
 	for rf.killed() == false {
-		if !rf.beat.Load() {
+		tester.Annotate(fmt.Sprintf("Server %v", rf.me), "tries election", "tries election")
+		if rf.beat.Load() == false {
 			rf.mu.Lock()
 			notLeader := rf.state != leader
 			rf.mu.Unlock()
@@ -431,6 +573,23 @@ func (rf *Raft) startElectionLoop() {
 
 		ms := 300 + (rand.Int63() % 300)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
+	}
+}
+
+func (rf *Raft) startApplierLoop() {
+	for !rf.killed() {
+		rf.mu.Lock()
+		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+			tester.Annotate(fmt.Sprintf("Server %v", rf.me), "applies", fmt.Sprintf("applies %v", i))
+			rf.applyCh <- raftapi.ApplyMsg{
+				CommandValid: true,
+				Command:      rf.logs[i].Data,
+				CommandIndex: i,
+			}
+			rf.lastApplied = i
+		}
+		rf.mu.Unlock()
+		time.Sleep(commitTimeout)
 	}
 }
 
@@ -450,6 +609,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 	rf.dead = 0
+	rf.applyCh = applyCh
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.logs = []LogEntry{{Term: 0, Index: 0}} // Sentinel
@@ -467,6 +627,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start startElectionLoop goroutine to start elections
 	go rf.startElectionLoop()
+	go rf.startCommitLoop()
+	go rf.startApplierLoop()
+	for i, _ := range rf.peers {
+		if i != rf.me {
+			go rf.startAppendEntriesLoop(i)
+			go rf.startHeartbeatLoop(i)
+		}
+	}
 
 	return rf
 }
