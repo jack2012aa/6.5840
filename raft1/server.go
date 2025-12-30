@@ -66,7 +66,7 @@ func (rs *rfsrv) Kill() {
 	rs.raft = nil // tester will call Kill() on rs.raft
 	rs.mu.Unlock()
 	if rs.persister != nil {
-		// mimic KV server that saves its persistent state in case it
+		// mimic KV server that saves its persistent raftState in case it
 		// restarts.
 		raftlog := rs.persister.ReadRaftState()
 		snapshot := rs.persister.ReadSnapshot()
@@ -115,7 +115,7 @@ func (rs *rfsrv) applier(applyCh chan raftapi.ApplyMsg) {
 	}
 }
 
-// periodically snapshot raft state
+// periodically snapshot raft raftState
 func (rs *rfsrv) applierSnap(applyCh chan raftapi.ApplyMsg) {
 	if rs.raft == nil {
 		return // ???
