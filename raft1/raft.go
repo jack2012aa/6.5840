@@ -171,10 +171,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // Get the last log index and term
 func (rf *Raft) getLastLogIdxTerm() (int, int) {
 	idx := len(rf.logs) - 1
-	term := 0
-	if idx != -1 {
-		term = rf.logs[idx].Term
-	}
+	term := rf.logs[idx].Term
 	return idx, term
 }
 
@@ -287,7 +284,8 @@ func (rf *Raft) startHeartbeatLoop() {
 			}
 			go func(i int) {
 				rf.mu.Lock()
-				idx, term := rf.getLastLogIdxTerm()
+				idx := rf.nextIndex[i] - 1
+				term := rf.logs[idx].Term
 				args := AppendEntriesArgs{
 					Term:         rf.currentTerm,
 					Leader:       rf.me,
@@ -383,12 +381,12 @@ func (rf *Raft) maybeBecomeFollower(term int) bool {
 func (rf *Raft) becomeLeader() {
 	tester.Annotate(fmt.Sprintf("Server %v", rf.me), "-> leader", "becomes leader")
 	rf.state = leader
-	lastLogIndex, _ := rf.getLastLogIdxTerm()
+	idx, _ := rf.getLastLogIdxTerm()
 	for i := range len(rf.peers) {
 		if i == rf.me {
 			continue
 		}
-		rf.nextIndex[i] = lastLogIndex + 1
+		rf.nextIndex[i] = idx + 1
 		rf.matchIndex[i] = 0
 	}
 	go rf.startHeartbeatLoop()
@@ -454,9 +452,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.dead = 0
 	rf.currentTerm = 0
 	rf.votedFor = -1
-	rf.logs = make([]LogEntry, 0)
-	rf.commitIndex = -1
-	rf.lastApplied = -1
+	rf.logs = []LogEntry{{Term: 0, Index: 0}} // Sentinel
+	rf.commitIndex = 0
+	rf.lastApplied = 0
 	rf.state = follower
 	rf.beat.Store(false)
 	rf.nextIndex = make([]int, len(rf.peers))
