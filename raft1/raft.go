@@ -154,6 +154,19 @@ func (rf *Raft) rejectVote(reply *RequestVoteReply) {
 	reply.VoteGranted = false
 }
 
+// isLogUpToDate checks whether the argument idx and term is up to local state. Must be used with lock.
+func (rf *Raft) isLogUpToDate(idx int, term int) bool {
+	myIdx, myTerm := rf.getLastLogIdxTerm()
+	switch {
+	case myTerm > term:
+		return false
+	case myTerm < term:
+		return true
+	default:
+		return myIdx <= idx
+	}
+}
+
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
@@ -162,9 +175,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	switch {
 	case args.Term < rf.currentTerm:
 		rf.rejectVote(reply)
-	case args.LastLogIndex < len(rf.logs)-1:
-		rf.rejectVote(reply)
-	case rf.votedFor == -1 || rf.votedFor == args.Candidate:
+	case (rf.votedFor == -1 || rf.votedFor == args.Candidate) && rf.isLogUpToDate(args.LastLogIndex, args.LastLogTerm):
 		rf.beat.Store(true)
 		rf.acceptVote(args, reply)
 	default:
@@ -288,29 +299,31 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		tester.Annotate(fmt.Sprintf("Server %v", rf.me), "rejects append", "incorrect term")
 		return
 	}
+	updatedIdx := args.PrevLogIndex
 	for i, entry := range args.Entries {
 		if entry.Index > lastIdx {
 			rf.logs = append(rf.logs, args.Entries[i:]...)
+			updatedIdx = args.Entries[len(args.Entries)-1-i].Index
 			tester.Annotate(fmt.Sprintf("Server %v", rf.me), "appends", fmt.Sprintf("appends left: %v right: %v", entry.Index, args.Entries[len(args.Entries)-1].Index))
 			break
 		} else if entry.Term != rf.logs[entry.Index].Term {
 			tester.Annotate(fmt.Sprintf("Server %v", rf.me), "appends", fmt.Sprintf("appends left: %v right: %v", entry.Index, args.Entries[len(args.Entries)-1].Index))
 			rf.logs = rf.logs[:entry.Index]
 			rf.logs = append(rf.logs, args.Entries[i:]...)
+			updatedIdx = args.Entries[len(args.Entries)-1-i].Index
 			break
 		}
 	}
-	lastIdx, _ = rf.getLastLogIdxTerm()
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = args.LeaderCommit
-		if lastIdx < args.LeaderCommit {
-			rf.commitIndex = lastIdx
+		if updatedIdx < args.LeaderCommit {
+			rf.commitIndex = updatedIdx
 		}
 	}
 	reply.Term = rf.currentTerm
 	reply.Success = true
-	reply.PrevLogIndex = lastIdx
-	reply.MatchIndex = lastIdx
+	reply.PrevLogIndex = updatedIdx
+	reply.MatchIndex = updatedIdx
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -336,11 +349,9 @@ func (rf *Raft) prepareAppendEntries(server int) (AppendEntriesArgs, AppendEntri
 
 // handleAppendEntriesReply must be used with lock
 func (rf *Raft) handleAppendEntriesReply(server int, reply AppendEntriesReply) {
-	if reply.Term != rf.currentTerm {
-		return
-	}
 	if rf.maybeBecomeFollower(reply.Term) {
 		rf.beat.Store(true)
+		return
 	}
 	if reply.Success {
 		tester.Annotate(fmt.Sprintf("Server %v", rf.me), "append successes", fmt.Sprintf("server: %v, next: %v, match: %v", server, reply.PrevLogIndex+1, reply.MatchIndex))
@@ -349,9 +360,7 @@ func (rf *Raft) handleAppendEntriesReply(server int, reply AppendEntriesReply) {
 			rf.nextIndex[server] = reply.PrevLogIndex + 1
 		}
 	} else {
-		if rf.matchIndex[server] <= reply.PrevLogIndex && rf.nextIndex[server] >= reply.PrevLogIndex {
-			rf.nextIndex[server] = reply.PrevLogIndex
-		}
+		rf.nextIndex[server] = reply.PrevLogIndex + 1
 	}
 }
 
