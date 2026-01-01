@@ -266,14 +266,18 @@ type AppendEntriesReply struct {
 	Term         int
 	PrevLogIndex int
 	MatchIndex   int
+	XTerm        int // conflicting term
+	XIndex       int // conflicting index
 	Success      bool
 }
 
 // rejectAppendEntries must be used with lock
-func (rf *Raft) rejectAppendEntries(reply *AppendEntriesReply, idx int) {
+func (rf *Raft) rejectAppendEntries(reply *AppendEntriesReply, idx int, xTerm int, xIndex int) {
 	reply.Term = rf.currentTerm
 	reply.PrevLogIndex = idx
 	reply.MatchIndex = -1
+	reply.XTerm = xTerm
+	reply.XIndex = xIndex
 	reply.Success = false
 }
 
@@ -285,17 +289,24 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	lastIdx, _ := rf.getLastLogIdxTerm()
 	if args.Term < rf.currentTerm {
-		rf.rejectAppendEntries(reply, lastIdx)
+		rf.rejectAppendEntries(reply, lastIdx, -1, -1)
 		return
 	}
 	rf.beat.Store(true)
 	if lastIdx < args.PrevLogIndex {
-		rf.rejectAppendEntries(reply, lastIdx)
+		rf.rejectAppendEntries(reply, lastIdx, -1, -1)
 		tester.Annotate(fmt.Sprintf("Server %v", rf.me), "rejects append", "far index")
 		return
 	}
 	if rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
-		rf.rejectAppendEntries(reply, args.PrevLogIndex-1)
+		xTerm := rf.logs[args.PrevLogIndex].Term
+		xIdx := args.PrevLogIndex
+		for ; xIdx >= 1; xIdx-- {
+			if rf.logs[xIdx-1].Term != xTerm {
+				break
+			}
+		}
+		rf.rejectAppendEntries(reply, xIdx, xTerm, xIdx)
 		tester.Annotate(fmt.Sprintf("Server %v", rf.me), "rejects append", "incorrect term")
 		return
 	}
@@ -360,7 +371,14 @@ func (rf *Raft) handleAppendEntriesReply(server int, reply AppendEntriesReply) {
 			rf.nextIndex[server] = reply.PrevLogIndex + 1
 		}
 	} else {
-		rf.nextIndex[server] = reply.PrevLogIndex + 1
+		switch reply.XTerm {
+		case -1: // Term late or logs is too short. The first case is handled at the beginning of this func.
+			rf.nextIndex[server] = reply.PrevLogIndex + 1
+		case rf.logs[reply.XIndex].Term:
+			rf.nextIndex[server] = reply.XIndex + 1
+		default:
+			rf.nextIndex[server] = reply.XIndex
+		}
 	}
 }
 
