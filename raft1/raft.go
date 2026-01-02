@@ -7,8 +7,9 @@ package raft
 // Make() creates a new raft peer that implements the raft interface.
 
 import (
+	"bytes"
 	"fmt"
-	"math"
+	"slices"
 
 	//	"bytes"
 	"math/rand"
@@ -16,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"6.5840/labgob"
 	//	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
@@ -80,34 +82,47 @@ func (rf *Raft) GetState() (int, bool) {
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
 func (rf *Raft) persist() {
-	// Your code here (3C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	b := new(bytes.Buffer)
+	e := labgob.NewEncoder(b)
+	err := e.Encode(rf.currentTerm)
+	if err != nil {
+		panic(err)
+	}
+	err = e.Encode(rf.votedFor)
+	if err != nil {
+		panic(err)
+	}
+	err = e.Encode(rf.logs)
+	if err != nil {
+		panic(err)
+	}
+	s := b.Bytes()
+	rf.persister.Save(s, nil)
 }
 
 // restore previously persisted raftState.
 func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any raftState?
-		return
+	if len(data) > 0 {
+		b := bytes.NewBuffer(data)
+		d := labgob.NewDecoder(b)
+		var currentTerm, votedFor int
+		var logs []LogEntry
+		err := d.Decode(&currentTerm)
+		if err != nil {
+			panic(err)
+		}
+		err = d.Decode(&votedFor)
+		if err != nil {
+			panic(err)
+		}
+		err = d.Decode(&logs)
+		if err != nil {
+			panic(err)
+		}
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.logs = logs
 	}
-	// Your code here (3C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
 }
 
 // how many bytes in Raft's persisted log?
@@ -146,6 +161,7 @@ func (rf *Raft) acceptVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.votedFor = args.Candidate
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = true
+	rf.persist()
 }
 
 // rejectVote must be used with lock
@@ -186,8 +202,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // getLastLogIdxTerm must be used with lock
 // Get the last log index and term
 func (rf *Raft) getLastLogIdxTerm() (int, int) {
-	idx := len(rf.logs) - 1
-	term := rf.logs[idx].Term
+	idx := rf.logs[len(rf.logs)-1].Index
+	term := rf.logs[len(rf.logs)-1].Term
 	return idx, term
 }
 
@@ -271,6 +287,18 @@ type AppendEntriesReply struct {
 	Success      bool
 }
 
+func (r *AppendEntriesReply) isFailedBecauseOldTerm() bool {
+	return r.PrevLogIndex == -1
+}
+
+func (r *AppendEntriesReply) isFailedBecauseFarIndex() bool {
+	return !r.isFailedBecauseOldTerm() && r.XTerm == -1 && r.XIndex == -1
+}
+
+func (r *AppendEntriesReply) isFailedBecauseWrongTerm() bool {
+	return r.XTerm != -1 && r.XIndex != -1
+}
+
 // rejectAppendEntries must be used with lock
 func (rf *Raft) rejectAppendEntries(reply *AppendEntriesReply, idx int, xTerm int, xIndex int) {
 	reply.Term = rf.currentTerm
@@ -281,6 +309,19 @@ func (rf *Raft) rejectAppendEntries(reply *AppendEntriesReply, idx int, xTerm in
 	reply.Success = false
 }
 
+func (rf *Raft) rejectAppendEntriesOldTerm(reply *AppendEntriesReply) {
+	rf.rejectAppendEntries(reply, -1, -1, -1)
+}
+
+func (rf *Raft) rejectAppendEntriesFarIndex(reply *AppendEntriesReply) {
+	lastIdx, _ := rf.getLastLogIdxTerm()
+	rf.rejectAppendEntries(reply, lastIdx, -1, -1)
+}
+
+func (rf *Raft) rejectAppendEntriesWrongTerm(reply *AppendEntriesReply, xTerm int, xIndex int) {
+	rf.rejectAppendEntries(reply, xIndex, xTerm, xIndex)
+}
+
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -289,12 +330,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	lastIdx, _ := rf.getLastLogIdxTerm()
 	if args.Term < rf.currentTerm {
-		rf.rejectAppendEntries(reply, lastIdx, -1, -1)
+		rf.rejectAppendEntriesOldTerm(reply)
 		return
 	}
 	rf.beat.Store(true)
 	if lastIdx < args.PrevLogIndex {
-		rf.rejectAppendEntries(reply, lastIdx, -1, -1)
+		rf.rejectAppendEntriesFarIndex(reply)
 		tester.Annotate(fmt.Sprintf("Server %v", rf.me), "rejects append", "far index")
 		return
 	}
@@ -306,22 +347,23 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				break
 			}
 		}
-		rf.rejectAppendEntries(reply, xIdx, xTerm, xIdx)
+		rf.rejectAppendEntriesWrongTerm(reply, xTerm, xIdx)
 		tester.Annotate(fmt.Sprintf("Server %v", rf.me), "rejects append", "incorrect term")
 		return
 	}
 	updatedIdx := args.PrevLogIndex
+	if len(args.Entries) > 0 {
+		updatedIdx = args.Entries[len(args.Entries)-1].Index
+	}
 	for i, entry := range args.Entries {
 		if entry.Index > lastIdx {
 			rf.logs = append(rf.logs, args.Entries[i:]...)
-			updatedIdx = args.Entries[len(args.Entries)-1-i].Index
 			tester.Annotate(fmt.Sprintf("Server %v", rf.me), "appends", fmt.Sprintf("appends left: %v right: %v", entry.Index, args.Entries[len(args.Entries)-1].Index))
 			break
 		} else if entry.Term != rf.logs[entry.Index].Term {
 			tester.Annotate(fmt.Sprintf("Server %v", rf.me), "appends", fmt.Sprintf("appends left: %v right: %v", entry.Index, args.Entries[len(args.Entries)-1].Index))
 			rf.logs = rf.logs[:entry.Index]
 			rf.logs = append(rf.logs, args.Entries[i:]...)
-			updatedIdx = args.Entries[len(args.Entries)-1-i].Index
 			break
 		}
 	}
@@ -335,6 +377,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = true
 	reply.PrevLogIndex = updatedIdx
 	reply.MatchIndex = updatedIdx
+	rf.persist()
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -360,24 +403,29 @@ func (rf *Raft) prepareAppendEntries(server int) (AppendEntriesArgs, AppendEntri
 
 // handleAppendEntriesReply must be used with lock
 func (rf *Raft) handleAppendEntriesReply(server int, reply AppendEntriesReply) {
-	if rf.maybeBecomeFollower(reply.Term) {
+	switch {
+	case rf.maybeBecomeFollower(reply.Term):
 		rf.beat.Store(true)
-		return
-	}
-	if reply.Success {
+	case reply.Success:
 		tester.Annotate(fmt.Sprintf("Server %v", rf.me), "append successes", fmt.Sprintf("server: %v, next: %v, match: %v", server, reply.PrevLogIndex+1, reply.MatchIndex))
 		if rf.matchIndex[server] < reply.MatchIndex {
 			rf.matchIndex[server] = reply.MatchIndex
 			rf.nextIndex[server] = reply.PrevLogIndex + 1
 		}
-	} else {
-		switch reply.XTerm {
-		case -1: // Term late or logs is too short. The first case is handled at the beginning of this func.
-			rf.nextIndex[server] = reply.PrevLogIndex + 1
-		case rf.logs[reply.XIndex].Term:
-			rf.nextIndex[server] = reply.XIndex + 1
-		default:
+	case reply.isFailedBecauseFarIndex():
+		rf.nextIndex[server] = reply.PrevLogIndex + 1
+	case reply.isFailedBecauseWrongTerm():
+		idx := -1
+		for i := len(rf.logs) - 1; i >= 0; i-- {
+			if rf.logs[i].Term == reply.XTerm {
+				idx = i
+				break
+			}
+		}
+		if idx == -1 {
 			rf.nextIndex[server] = reply.XIndex
+		} else {
+			rf.nextIndex[server] = idx + 1
 		}
 	}
 }
@@ -393,41 +441,12 @@ func (rf *Raft) tryAppendEntries(server int) {
 	}
 }
 
-// startAppendEntriesLoop starts the data plane that sends entries in a serialized manner.
+// startAppendEntriesLoop starts a loop that sends an AppendEntries request to server.
+// Since Call is blocking, requests are sent in a parallelized manner.
 func (rf *Raft) startAppendEntriesLoop(server int) {
 	for !rf.killed() {
-		if _, isLeader := rf.GetState(); isLeader == false {
-			time.Sleep(heartbeatTimeout)
-			continue
-		}
-		now := time.Now()
-		rf.tryAppendEntries(server)
-		delta := time.Since(now)
-		if delta < heartbeatTimeout {
-			time.Sleep(heartbeatTimeout - delta)
-		}
-	}
-}
-
-// startHeartbeatLoop starts the control plane that sends empty args in a parallelized manner.
-//
-// Since rpc.Call is blocking, heartbeat must be sent in parallel so once reconnect, server state can be rebuilt quickly.
-func (rf *Raft) startHeartbeatLoop(server int) {
-	for !rf.killed() {
 		if _, isLeader := rf.GetState(); isLeader {
-			rf.mu.Lock()
-			args := AppendEntriesArgs{Term: rf.currentTerm, Leader: rf.me, PrevLogIndex: math.MaxInt}
-			reply := AppendEntriesReply{}
-			rf.mu.Unlock()
-			go func(args AppendEntriesArgs, reply AppendEntriesReply) {
-				tester.Annotate(fmt.Sprintf("Server %v", rf.me), fmt.Sprintf("beats %v", server), fmt.Sprintf("beats %v", server))
-				rf.sendAppendEntries(server, &args, &reply)
-				rf.mu.Lock()
-				if rf.maybeBecomeFollower(reply.Term) {
-					rf.beat.Store(true)
-				}
-				rf.mu.Unlock()
-			}(args, reply)
+			go rf.tryAppendEntries(server)
 		}
 		time.Sleep(heartbeatTimeout)
 	}
@@ -435,7 +454,6 @@ func (rf *Raft) startHeartbeatLoop(server int) {
 
 // maybeCommit tries to commit log at idx. It must be used with lock
 func (rf *Raft) maybeCommit(idx int) bool {
-	//tester.Annotate(fmt.Sprintf("Server %v", rf.me), "tries to commit", fmt.Sprintf("tries to commit %d", idx))
 	if rf.logs[idx].Term != rf.currentTerm {
 		return false
 	}
@@ -447,7 +465,6 @@ func (rf *Raft) maybeCommit(idx int) bool {
 		}
 		if matches > majority {
 			rf.commitIndex = idx
-			tester.Annotate(fmt.Sprintf("Server %v", rf.me), "commits", fmt.Sprintf("commits %d", idx))
 			return true
 		}
 	}
@@ -462,10 +479,16 @@ func (rf *Raft) startCommitLoop() {
 		if isLeader {
 			rf.mu.Lock()
 			lastIdx, _ := rf.getLastLogIdxTerm()
+			left, right := lastIdx, -1
 			for i := rf.commitIndex + 1; i <= lastIdx; i++ {
-				rf.maybeCommit(i)
+				if rf.maybeCommit(i) {
+					right = i
+				}
 			}
 			rf.mu.Unlock()
+			if right != -1 {
+				tester.Annotate(fmt.Sprintf("Server %v", rf.me), "commits", fmt.Sprintf("commits left: %v, right: %v", left, right))
+			}
 		}
 		time.Sleep(commitTimeout)
 	}
@@ -490,12 +513,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if !isLeader {
 		return -1, -1, false
 	}
-	tester.Annotate(fmt.Sprintf("Server %v", rf.me), "starts", fmt.Sprintf("starts %v", command))
 	lastIdx, _ := rf.getLastLogIdxTerm()
+	tester.Annotate(fmt.Sprintf("Server %v", rf.me), "starts", fmt.Sprintf("starts %v at index %v", command, lastIdx+1))
 	rf.logs = append(rf.logs, LogEntry{Data: command, Term: rf.currentTerm, Index: lastIdx + 1})
-	rf.nextIndex[rf.me] = lastIdx + 1
-	rf.matchIndex[rf.me] = rf.nextIndex[rf.me] + 1
+	rf.nextIndex[rf.me] = lastIdx + 2
+	rf.matchIndex[rf.me] = lastIdx + 1
 	index, term := rf.getLastLogIdxTerm()
+	rf.persist()
 	return index, term, isLeader
 }
 
@@ -531,6 +555,7 @@ func (rf *Raft) prepareElection() (RequestVoteArgs, []RequestVoteReply) {
 		LastLogTerm:  term,
 	}
 	replies := make([]RequestVoteReply, len(rf.peers))
+	rf.persist()
 	return args, replies
 }
 
@@ -541,6 +566,7 @@ func (rf *Raft) maybeBecomeFollower(term int) bool {
 		rf.state = follower
 		rf.currentTerm = term
 		rf.votedFor = -1
+		rf.persist()
 		return true
 	}
 	return false
@@ -558,6 +584,7 @@ func (rf *Raft) becomeLeader() {
 		rf.nextIndex[i] = idx + 1
 		rf.matchIndex[i] = 0
 	}
+	rf.persist()
 }
 
 func (rf *Raft) startElection() {
@@ -572,7 +599,7 @@ func (rf *Raft) startElection() {
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	for *votes <= majority && *done < quorum {
+	for *votes <= majority && *done-*votes <= majority {
 		cond.Wait()
 	}
 
@@ -606,16 +633,21 @@ func (rf *Raft) startElectionLoop() {
 func (rf *Raft) startApplierLoop() {
 	for !rf.killed() {
 		rf.mu.Lock()
-		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-			tester.Annotate(fmt.Sprintf("Server %v", rf.me), "applies", fmt.Sprintf("applies %v", i))
-			rf.applyCh <- raftapi.ApplyMsg{
-				CommandValid: true,
-				Command:      rf.logs[i].Data,
-				CommandIndex: i,
+		if rf.commitIndex > rf.lastApplied {
+			toApply := slices.Clone(rf.logs[rf.lastApplied+1 : rf.commitIndex+1])
+			rf.lastApplied = rf.commitIndex
+			tester.Annotate(fmt.Sprintf("Server %v", rf.me), "applies", fmt.Sprintf("applies left: %v, right: %v", rf.lastApplied+1, rf.lastApplied))
+			rf.mu.Unlock()
+			for _, entry := range toApply {
+				rf.applyCh <- raftapi.ApplyMsg{
+					CommandValid: true,
+					Command:      entry.Data,
+					CommandIndex: entry.Index,
+				}
 			}
-			rf.lastApplied = i
+		} else {
+			rf.mu.Unlock()
 		}
-		rf.mu.Unlock()
 		time.Sleep(commitTimeout)
 	}
 }
@@ -647,8 +679,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
 
-	// Your initialization code here (3A, 3B, 3C).
-
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
@@ -659,7 +689,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	for i, _ := range rf.peers {
 		if i != rf.me {
 			go rf.startAppendEntriesLoop(i)
-			go rf.startHeartbeatLoop(i)
 		}
 	}
 
