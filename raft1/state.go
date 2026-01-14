@@ -202,6 +202,10 @@ func tryCommit(r *Raft, last int) {
 	if last < r.commitIndex {
 		return
 	}
+	i := last - r.logs[0].Index
+	if i < 0 || r.logs[i].Term != r.currentTerm {
+		return
+	}
 	majority := len(r.peers) / 2
 	matches := 0
 	for _, i := range r.matchIndex {
@@ -253,7 +257,7 @@ func leaderHandleAppendEntriesReply(r *Raft, e raftEvent) {
 		lastFromXTerm := -1
 		for i := len(r.logs) - 1; i >= 0; i-- {
 			if r.logs[i].Term == reply.XTerm {
-				lastFromXTerm = i
+				lastFromXTerm = r.logs[i].Index
 				break
 			}
 		}
@@ -369,6 +373,9 @@ func stateLeader(r *Raft) stateFunc {
 		if i != r.me {
 			r.nextIndex[i] = r.logs[last].Index
 			r.matchIndex[i] = 0
+		} else {
+			r.nextIndex[i] = r.logs[len(r.logs)-1].Index
+			r.matchIndex[i] = r.nextIndex[i] - 1
 		}
 	}
 	r.persist()
@@ -542,7 +549,7 @@ func candidateHandleRequestVoteReply(r *Raft, e raftEvent) {
 }
 
 func electionTimeout() time.Duration {
-	return time.Duration(300+(rand.Int63()%300)) * time.Millisecond
+	return time.Duration(300+(rand.Int63()%100)) * time.Millisecond
 }
 
 func stateCandidate(r *Raft) stateFunc {
@@ -620,6 +627,7 @@ func followerHandleAppendEntries(r *Raft, e raftEvent) {
 		}()
 		return
 	}
+	r.electionTimer = time.After(electionTimeout())
 	last := len(r.logs) - 1
 	if r.logs[last].Index < args.PrevLogIndex {
 		reply.Term = r.currentTerm
@@ -719,7 +727,6 @@ func followerHandleAppendEntries(r *Raft, e raftEvent) {
 			fmt.Sprintf("update commit index: %v", r.commitIndex),
 		)
 	}
-	r.electionTimer = time.After(electionTimeout())
 	reply.Term = r.currentTerm
 	reply.Success = true
 	reply.PrevLogIndex = updatedIdx
