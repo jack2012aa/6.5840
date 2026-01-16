@@ -1,6 +1,7 @@
 package rsm
 
 import (
+	"fmt"
 	"sync"
 
 	"6.5840/kvsrv1/rpc"
@@ -13,9 +14,9 @@ import (
 var useRaftStateMachine bool // to plug in another raft besided raft1
 
 type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+	Command any
+	Me      int
+	Id      int
 }
 
 // A server (i.e., ../server.go) that wants to replicate itself calls
@@ -35,9 +36,13 @@ type RSM struct {
 	me           int
 	rf           raftapi.Raft
 	applyCh      chan raftapi.ApplyMsg
+	submitCh     chan submitEvent
+	killedCh     chan struct{}
 	maxraftstate int // snapshot if log grows this big
 	sm           StateMachine
-	// Your definitions here.
+	increasingId int
+	indexToCh    map[int]chan any
+	indexToId    map[int]int
 }
 
 // servers[] contains the ports of the set of
@@ -60,12 +65,82 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 		me:           me,
 		maxraftstate: maxraftstate,
 		applyCh:      make(chan raftapi.ApplyMsg),
+		submitCh:     make(chan submitEvent),
+		killedCh:     make(chan struct{}),
 		sm:           sm,
+		increasingId: 0,
+		indexToCh:    make(map[int]chan any),
+		indexToId:    make(map[int]int),
 	}
 	if !useRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
+	go rsm.eventLoop()
 	return rsm
+}
+
+func (rsm *RSM) cancelAll() {
+	for _, ch := range rsm.indexToCh {
+		go func(ch chan any) {
+			close(ch)
+		}(ch)
+	}
+	clear(rsm.indexToCh)
+	clear(rsm.indexToId)
+}
+
+func (rsm *RSM) eventLoop() {
+	for {
+		select {
+		case msg, ok := <-rsm.applyCh:
+			if !ok {
+				select {
+				case <-rsm.killedCh:
+					// Is killed
+				default:
+					close(rsm.killedCh)
+					tester.Annotate(fmt.Sprintf("Server %v", rsm.me), "close", "close")
+				}
+				return
+			}
+			index := msg.CommandIndex
+			op := msg.Command.(Op)
+			result := rsm.sm.DoOp(op.Command)
+			ch, exists := rsm.indexToCh[index]
+			if exists {
+				if op.Me == rsm.me {
+					if op.Id != rsm.indexToId[index] {
+						panic("undefined behavior")
+					}
+					tester.Annotate(fmt.Sprintf("Server %v", rsm.me), "apply", fmt.Sprintf("index: %v, id: %v", index, rsm.indexToId[index]))
+					delete(rsm.indexToCh, index)
+					delete(rsm.indexToId, index)
+					go func() {
+						ch <- result
+					}()
+				} else {
+					tester.Annotate(fmt.Sprintf("Server %v", rsm.me), "cancel", fmt.Sprintf("index: %v, id: %v", index, rsm.indexToId[index]))
+					rsm.cancelAll()
+				}
+			}
+		case e := <-rsm.submitCh:
+			id := rsm.increasingId
+			rsm.increasingId++
+			op := Op{Me: rsm.me, Id: id, Command: e.req}
+			index, _, ok := rsm.rf.Start(op)
+			if !ok {
+				close(e.resultCh)
+			} else {
+				tester.Annotate(fmt.Sprintf("Server %v", rsm.me), "submit", fmt.Sprintf("index: %v, id: %d", index, id))
+				ch, exists := rsm.indexToCh[index]
+				if exists {
+					close(ch)
+				}
+				rsm.indexToCh[index] = e.resultCh
+				rsm.indexToId[index] = id
+			}
+		}
+	}
 }
 
 func (rsm *RSM) Raft() raftapi.Raft {
@@ -76,11 +151,26 @@ func (rsm *RSM) Raft() raftapi.Raft {
 // should return ErrWrongLeader if client should find new leader and
 // try again.
 func (rsm *RSM) Submit(req any) (rpc.Err, any) {
+	ch := make(chan any, 1)
+	event := submitEvent{req, ch}
+	select {
+	case rsm.submitCh <- event:
+		// continue
+	case <-rsm.killedCh:
+		return rpc.ErrWrongLeader, nil
+	}
+	select {
+	case result, ok := <-ch:
+		if !ok || result == nil {
+			return rpc.ErrWrongLeader, nil
+		}
+		return rpc.OK, result
+	case <-rsm.killedCh:
+		return rpc.ErrWrongLeader, nil
+	}
+}
 
-	// Submit creates an Op structure to run a command through Raft;
-	// for example: op := Op{Me: rsm.me, Id: id, Req: req}, where req
-	// is the argument to Submit and id is a unique id for the op.
-
-	// your code here
-	return rpc.ErrWrongLeader, nil // i'm dead, try another server.
+type submitEvent struct {
+	req      any
+	resultCh chan any
 }
