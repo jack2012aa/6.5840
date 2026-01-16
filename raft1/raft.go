@@ -9,6 +9,7 @@ package raft
 import (
 	"bytes"
 	"fmt"
+	"sync"
 
 	//	"bytes"
 	"sync/atomic"
@@ -46,6 +47,7 @@ type Raft struct {
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 	applyCh   chan raftapi.ApplyMsg
+	mu        sync.Mutex
 
 	// Persistent states
 	currentTerm int
@@ -54,15 +56,16 @@ type Raft struct {
 	snapshot    Snapshot
 
 	// Volatile states
-	commitIndex    int
-	lastApplied    int
-	state          raftState
-	stateF         stateFunc
-	eQ             chan raftEvent
-	killedChan     chan struct{}
-	grantedVote    int
-	electionTimer  <-chan time.Time
-	heartbeatTimer <-chan time.Time
+	commitIndex     int
+	lastApplied     int
+	state           raftState
+	stateF          stateFunc
+	eQ              chan raftEvent
+	killedChan      chan struct{}
+	killedReplyChan chan struct{}
+	grantedVote     int
+	electionTimer   <-chan time.Time
+	heartbeatTimer  <-chan time.Time
 
 	// Leader states
 	nextIndex  []int
@@ -291,9 +294,11 @@ func (r *Raft) Start(command interface{}) (int, int, bool) {
 // confusing debug output. any goroutine with a long-running loop
 // should call killed() to check whether it should stop.
 func (r *Raft) Kill() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.killedChan <- struct{}{}
+	<-r.killedReplyChan
 	atomic.StoreInt32(&r.dead, 1)
-	// Your code here, if desired.
 }
 
 func (r *Raft) killed() bool {
@@ -316,6 +321,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	r.peers = peers
 	r.persister = persister
 	r.me = me
+	r.mu = sync.Mutex{}
 	r.dead = 0
 	r.applyCh = applyCh
 
@@ -329,6 +335,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	r.stateF = stateFollower
 	r.eQ = make(chan raftEvent)
 	r.killedChan = make(chan struct{})
+	r.killedReplyChan = make(chan struct{})
 	r.grantedVote = 0
 
 	r.nextIndex = make([]int, len(r.peers))
@@ -343,6 +350,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			r.stateF = r.stateF(r)
 			tester.Annotate(fmt.Sprintf("Server %v", r.me), "state", string(r.state))
 		}
+		close(r.applyCh)
+		r.killedReplyChan <- struct{}{}
 	}()
 
 	return r
