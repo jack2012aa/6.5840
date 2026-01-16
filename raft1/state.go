@@ -56,7 +56,7 @@ func handleSnapshotEvent(r *Raft, e raftEvent) {
 	r.snapshot = s
 	r.persist()
 	go func() {
-		se.done <- struct{}{}
+		pushOrFail(se.done, struct{}{}, r.killedChan)
 	}()
 }
 
@@ -91,11 +91,11 @@ func handleStart(r *Raft, e raftEvent) {
 		panic("not a startEvent")
 	}
 	go func() {
-		se.done <- struct {
+		pushOrFail(se.done, struct {
 			index    int
 			term     int
 			isLeader bool
-		}{-1, -1, r.state == leader}
+		}{-1, -1, r.state == leader}, r.killedChan)
 	}()
 }
 
@@ -105,10 +105,10 @@ func handleGetState(r *Raft, e raftEvent) {
 		panic("not a getStateEvent")
 	}
 	go func() {
-		ge.done <- struct {
+		pushOrFail(ge.done, struct {
 			isLeader bool
 			term     int
-		}{r.state == leader, r.currentTerm}
+		}{r.state == leader, r.currentTerm}, r.killedChan)
 	}()
 }
 
@@ -118,7 +118,7 @@ func handlePersistBytes(r *Raft, e raftEvent) {
 		panic("not a PersistBytesEvent")
 	}
 	go func() {
-		pe.done <- r.persister.RaftStateSize()
+		pushOrFail(pe.done, r.persister.RaftStateSize(), r.killedChan)
 	}()
 }
 
@@ -138,7 +138,7 @@ func appendEntriesTo(r *Raft, server int) {
 	reply := &AppendEntriesReply{}
 	go func() {
 		r.peers[server].Call("Raft.AppendEntries", args, reply)
-		r.eQ <- &appendEntriesReplyEvent{args: args, reply: reply, server: server}
+		pushOrFail[raftEvent](r.eQ, &appendEntriesReplyEvent{args: args, reply: reply, server: server}, r.killedChan)
 	}()
 }
 
@@ -150,7 +150,7 @@ func installSnapshotTo(r *Raft, server int) {
 	reply := &InstallSnapshotReply{}
 	go func() {
 		r.peers[server].Call("Raft.InstallSnapshot", args, reply)
-		r.eQ <- &installSnapshotReplyEvent{args: args, reply: reply, server: server}
+		pushOrFail[raftEvent](r.eQ, &installSnapshotReplyEvent{args: args, reply: reply, server: server}, r.killedChan)
 	}()
 }
 
@@ -180,7 +180,7 @@ func leaderHandleAppendEntries(r *Raft, e raftEvent) {
 	args := ae.args
 	if maybeBecomeFollower(r, args.Term, false) {
 		go func() {
-			r.eQ <- e
+			pushOrFail[raftEvent](r.eQ, e, r.killedChan)
 		}()
 	} else {
 		reply := ae.reply
@@ -190,7 +190,7 @@ func leaderHandleAppendEntries(r *Raft, e raftEvent) {
 		reply.XIndex = -1
 		reply.Success = false
 		go func() {
-			ae.done <- struct{}{}
+			pushOrFail(ae.done, struct{}{}, r.killedChan)
 		}()
 	}
 }
@@ -279,14 +279,14 @@ func leaderHandleInstallSnapshot(r *Raft, e raftEvent) {
 	args := ie.args
 	if maybeBecomeFollower(r, args.Term, false) {
 		go func() {
-			r.eQ <- e
+			pushOrFail[raftEvent](r.eQ, e, r.killedChan)
 		}()
 	} else {
 		reply := ie.reply
 		reply.Term = r.currentTerm
 		reply.Success = false
 		go func() {
-			ie.done <- struct{}{}
+			pushOrFail(ie.done, struct{}{}, r.killedChan)
 		}()
 	}
 }
@@ -323,7 +323,7 @@ func leaderHandleRequestVote(r *Raft, e raftEvent) {
 	reply := re.reply
 	if maybeBecomeFollower(r, args.Term, false) {
 		go func() {
-			r.eQ <- e
+			pushOrFail[raftEvent](r.eQ, e, r.killedChan)
 		}()
 	} else {
 		reply.Term = r.currentTerm
@@ -344,11 +344,11 @@ func leaderHandleStart(r *Raft, e raftEvent) {
 	r.matchIndex[r.me] = i
 	r.persist()
 	go func() {
-		se.done <- struct {
+		pushOrFail(se.done, struct {
 			index    int
 			term     int
 			isLeader bool
-		}{i, t, true}
+		}{i, t, true}, r.killedChan)
 	}()
 }
 
@@ -394,7 +394,7 @@ func stateLeader(r *Raft) stateFunc {
 		case <-heartbeatTimer:
 			tester.Annotate(fmt.Sprintf("Server %v", r.me), "heartbeat timeout", "heartbeat timeout")
 			go func() {
-				r.eQ <- &sendHeartbeatEvent{}
+				pushOrFail[raftEvent](r.eQ, &sendHeartbeatEvent{}, r.killedChan)
 			}()
 			heartbeatTimer = time.After(heartbeatTimeout)
 		case applyCh <- applyMsg:
@@ -427,7 +427,7 @@ func candidateHandleAppendEntries(r *Raft, e raftEvent) {
 	}
 	if maybeBecomeFollower(r, ae.args.Term, true) {
 		go func() {
-			r.eQ <- e
+			pushOrFail[raftEvent](r.eQ, e, r.killedChan)
 		}()
 	} else {
 		reply := ae.reply
@@ -437,7 +437,7 @@ func candidateHandleAppendEntries(r *Raft, e raftEvent) {
 		reply.XIndex = -1
 		reply.Success = false
 		go func() {
-			ae.done <- struct{}{}
+			pushOrFail(ae.done, struct{}{}, r.killedChan)
 		}()
 	}
 }
@@ -450,14 +450,14 @@ func candidateHandleInstallSnapshot(r *Raft, e raftEvent) {
 	args := ie.args
 	if maybeBecomeFollower(r, args.Term, true) {
 		go func() {
-			r.eQ <- e
+			pushOrFail[raftEvent](r.eQ, e, r.killedChan)
 		}()
 	} else {
 		reply := ie.reply
 		reply.Term = r.currentTerm
 		reply.Success = false
 		go func() {
-			ie.done <- struct{}{}
+			pushOrFail(ie.done, struct{}{}, r.killedChan)
 		}()
 	}
 }
@@ -487,7 +487,7 @@ func candidateHandleStartElection(r *Raft, e raftEvent) {
 			go func() {
 				reply := &RequestVoteReply{}
 				r.peers[i].Call("Raft.RequestVote", args, reply)
-				r.eQ <- &requestVoteReplyEvent{server: i, args: args, reply: reply}
+				pushOrFail[raftEvent](r.eQ, &requestVoteReplyEvent{server: i, args: args, reply: reply}, r.killedChan)
 			}()
 		}
 	}
@@ -502,7 +502,7 @@ func candidateHandleRequestVote(r *Raft, e raftEvent) {
 	args := re.args
 	if maybeBecomeFollower(r, args.Term, false) {
 		go func() {
-			r.eQ <- e
+			pushOrFail[raftEvent](r.eQ, e, r.killedChan)
 		}()
 	}
 	reply := re.reply
@@ -521,7 +521,7 @@ func candidateHandleRequestVote(r *Raft, e raftEvent) {
 		reply.VoteGranted = false
 	}
 	go func() {
-		re.done <- struct{}{}
+		pushOrFail(re.done, struct{}{}, r.killedChan)
 	}()
 }
 
@@ -583,7 +583,7 @@ func stateCandidate(r *Raft) stateFunc {
 		case <-r.electionTimer:
 			tester.Annotate(fmt.Sprintf("Server %v", r.me), "election timeout", "election timeout")
 			go func() {
-				r.eQ <- &startElectionEvent{}
+				pushOrFail[raftEvent](r.eQ, &startElectionEvent{}, r.killedChan)
 			}()
 			r.electionTimer = time.After(electionTimeout())
 		case applyCh <- applyMsg:
@@ -623,7 +623,7 @@ func followerHandleAppendEntries(r *Raft, e raftEvent) {
 		reply.XIndex = -1
 		reply.Success = false
 		go func() {
-			ae.done <- struct{}{}
+			pushOrFail(ae.done, struct{}{}, r.killedChan)
 		}()
 		return
 	}
@@ -636,7 +636,7 @@ func followerHandleAppendEntries(r *Raft, e raftEvent) {
 		reply.XIndex = -1
 		reply.Success = false
 		go func() {
-			ae.done <- struct{}{}
+			pushOrFail(ae.done, struct{}{}, r.killedChan)
 		}()
 		return
 	}
@@ -666,7 +666,7 @@ func followerHandleAppendEntries(r *Raft, e raftEvent) {
 		reply.XIndex = -1
 		reply.Success = false
 		go func() {
-			ae.done <- struct{}{}
+			pushOrFail(ae.done, struct{}{}, r.killedChan)
 		}()
 		return
 	}
@@ -687,7 +687,7 @@ func followerHandleAppendEntries(r *Raft, e raftEvent) {
 		reply.XIndex = xIdx
 		reply.Success = false
 		go func() {
-			ae.done <- struct{}{}
+			pushOrFail(ae.done, struct{}{}, r.killedChan)
 		}()
 		return
 	}
@@ -732,7 +732,7 @@ func followerHandleAppendEntries(r *Raft, e raftEvent) {
 	reply.PrevLogIndex = updatedIdx
 	r.persist()
 	go func() {
-		ae.done <- struct{}{}
+		pushOrFail(ae.done, struct{}{}, r.killedChan)
 	}()
 }
 
@@ -775,7 +775,7 @@ func followerHandleInstallSnapshot(r *Raft, e raftEvent) {
 	)
 	reply.Success = true
 	go func() {
-		ie.done <- struct{}{}
+		pushOrFail(ie.done, struct{}{}, r.killedChan)
 	}()
 }
 
@@ -809,7 +809,7 @@ func followerHandleRequestVote(r *Raft, e raftEvent) {
 		tester.Annotate(fmt.Sprintf("Server %v", r.me), "reject", fmt.Sprintf("%v", args.Candidate))
 	}
 	go func() {
-		re.done <- struct{}{}
+		pushOrFail(re.done, struct{}{}, r.killedChan)
 	}()
 }
 

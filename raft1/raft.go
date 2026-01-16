@@ -61,8 +61,8 @@ type Raft struct {
 	state           raftState
 	stateF          stateFunc
 	eQ              chan raftEvent
-	killedChan      chan struct{}
-	killedReplyChan chan struct{}
+	killedChan      chan any
+	killedReplyChan chan any
 	grantedVote     int
 	electionTimer   <-chan time.Time
 	heartbeatTimer  <-chan time.Time
@@ -72,6 +72,28 @@ type Raft struct {
 	matchIndex []int
 }
 
+// Push e to ch or fail when killed is closed.
+func pushOrFail[T any](ch chan T, e T, killed chan any) bool {
+	select {
+	case ch <- e:
+		return true
+	case <-killed:
+		return false
+	}
+}
+
+// Wait for the return value of ch or fail when killed is closed.
+// Return (result, success)
+func waitOrFail[T any](ch chan T, killed chan any) (T, bool) {
+	select {
+	case e := <-ch:
+		return e, true
+	case <-killed:
+		var zero T
+		return zero, false
+	}
+}
+
 // return currentTerm and whether this server
 // believes it is the leader.
 func (r *Raft) GetState() (int, bool) {
@@ -79,9 +101,14 @@ func (r *Raft) GetState() (int, bool) {
 		isLeader bool
 		term     int
 	})
-	r.eQ <- &getStateEvent{done: done}
-	result := <-done
-	return result.term, result.isLeader
+	if !pushOrFail[raftEvent](r.eQ, &getStateEvent{done: done}, r.killedChan) {
+		return 0, false
+	}
+	result, ok := waitOrFail(done, r.killedChan)
+	if ok {
+		return result.term, result.isLeader
+	}
+	return 0, false
 }
 
 // save Raft's persistent raftState to stable storage,
@@ -174,8 +201,10 @@ type InstallSnapshotReply struct {
 
 func (r *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	done := make(chan struct{})
-	r.eQ <- &installSnapshotEvent{args: args, reply: reply, done: done}
-	<-done
+	if !pushOrFail[raftEvent](r.eQ, &installSnapshotEvent{args: args, reply: reply, done: done}, r.killedChan) {
+		return
+	}
+	waitOrFail(done, r.killedChan)
 }
 
 // the service says it has created a snapshot that has
@@ -184,8 +213,10 @@ func (r *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshot
 // that index. Raft should now trim its log as much as possible.
 func (r *Raft) Snapshot(index int, snapshot []byte) {
 	done := make(chan struct{})
-	r.eQ <- &snapshotEvent{index: index, snapshot: snapshot, done: done}
-	<-done
+	if !pushOrFail[raftEvent](r.eQ, &snapshotEvent{index: index, snapshot: snapshot, done: done}, r.killedChan) {
+		return
+	}
+	waitOrFail(done, r.killedChan)
 }
 
 // example RequestVote RPC arguments structure.
@@ -222,8 +253,10 @@ func (r *Raft) isLogUpToDate(idx int, term int) bool {
 // example RequestVote RPC handler.
 func (r *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	done := make(chan struct{})
-	r.eQ <- &requestVoteEvent{args: args, reply: reply, done: done}
-	<-done
+	if !pushOrFail[raftEvent](r.eQ, &requestVoteEvent{args: args, reply: reply, done: done}, r.killedChan) {
+		return
+	}
+	waitOrFail(done, r.killedChan)
 }
 
 type AppendEntriesArgs struct {
@@ -257,8 +290,10 @@ func (r *AppendEntriesReply) isFailedBecauseWrongTerm() bool {
 
 func (r *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	done := make(chan struct{})
-	r.eQ <- &appendEntriesEvent{args: args, reply: reply, done: done}
-	<-done
+	if !pushOrFail[raftEvent](r.eQ, &appendEntriesEvent{args: args, reply: reply, done: done}, r.killedChan) {
+		return
+	}
+	waitOrFail(done, r.killedChan)
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -279,9 +314,14 @@ func (r *Raft) Start(command interface{}) (int, int, bool) {
 		term     int
 		isLeader bool
 	})
-	r.eQ <- &startEvent{command: command, done: done}
-	result := <-done
-	return result.index, result.term, result.isLeader
+	if !pushOrFail[raftEvent](r.eQ, &startEvent{command: command, done: done}, r.killedChan) {
+		return 0, 0, false
+	}
+	result, ok := waitOrFail(done, r.killedChan)
+	if ok {
+		return result.index, result.term, result.isLeader
+	}
+	return 0, 0, false
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -296,9 +336,13 @@ func (r *Raft) Start(command interface{}) (int, int, bool) {
 func (r *Raft) Kill() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.killedChan <- struct{}{}
-	<-r.killedReplyChan
-	atomic.StoreInt32(&r.dead, 1)
+	if r.dead == 0 {
+		close(r.killedChan)
+		select {
+		case <-r.killedReplyChan:
+		}
+		atomic.StoreInt32(&r.dead, 1)
+	}
 }
 
 func (r *Raft) killed() bool {
@@ -334,8 +378,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	r.state = follower
 	r.stateF = stateFollower
 	r.eQ = make(chan raftEvent)
-	r.killedChan = make(chan struct{})
-	r.killedReplyChan = make(chan struct{})
+	r.killedChan = make(chan any)
+	r.killedReplyChan = make(chan any)
 	r.grantedVote = 0
 
 	r.nextIndex = make([]int, len(r.peers))
@@ -351,7 +395,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			tester.Annotate(fmt.Sprintf("Server %v", r.me), "state", string(r.state))
 		}
 		close(r.applyCh)
-		r.killedReplyChan <- struct{}{}
+		close(r.killedReplyChan)
 	}()
 
 	return r
