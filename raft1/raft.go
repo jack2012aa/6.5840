@@ -66,6 +66,7 @@ type Raft struct {
 	grantedVote     int
 	electionTimer   <-chan time.Time
 	heartbeatTimer  <-chan time.Time
+	isDirty         bool
 
 	// Leader states
 	nextIndex  []int
@@ -100,7 +101,7 @@ func (r *Raft) GetState() (int, bool) {
 	done := make(chan struct {
 		isLeader bool
 		term     int
-	})
+	}, 1)
 	if !pushOrFail[raftEvent](r.eQ, &getStateEvent{done: done}, r.killedChan) {
 		return 0, false
 	}
@@ -118,8 +119,6 @@ func (r *Raft) GetState() (int, bool) {
 // second argument to persister.Save().
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
-//
-// Must be used with lock
 func (r *Raft) persist() {
 	b := new(bytes.Buffer)
 	e := labgob.NewEncoder(b)
@@ -184,7 +183,7 @@ func (r *Raft) readPersist(data []byte) {
 
 // how many bytes in Raft's persisted log?
 func (r *Raft) PersistBytes() int {
-	done := make(chan int)
+	done := make(chan int, 1)
 	r.eQ <- &PersistBytesEvent{done: done}
 	return <-done
 }
@@ -313,7 +312,7 @@ func (r *Raft) Start(command interface{}) (int, int, bool) {
 		index    int
 		term     int
 		isLeader bool
-	})
+	}, 1)
 	if !pushOrFail[raftEvent](r.eQ, &startEvent{command: command, done: done}, r.killedChan) {
 		return 0, 0, false
 	}
@@ -340,6 +339,9 @@ func (r *Raft) Kill() {
 		close(r.killedChan)
 		select {
 		case <-r.killedReplyChan:
+		}
+		select {
+		case <-r.applyCh:
 		}
 		atomic.StoreInt32(&r.dead, 1)
 	}
