@@ -3,6 +3,7 @@ package rsm
 import (
 	"fmt"
 	"sync"
+	"time"
 
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labrpc"
@@ -36,7 +37,6 @@ type RSM struct {
 	me           int
 	rf           raftapi.Raft
 	applyCh      chan raftapi.ApplyMsg
-	submitCh     chan submitEvent
 	killedCh     chan struct{}
 	maxraftstate int // snapshot if log grows this big
 	sm           StateMachine
@@ -63,9 +63,9 @@ type RSM struct {
 func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, maxraftstate int, sm StateMachine) *RSM {
 	rsm := &RSM{
 		me:           me,
+		mu:           sync.Mutex{},
 		maxraftstate: maxraftstate,
 		applyCh:      make(chan raftapi.ApplyMsg),
-		submitCh:     make(chan submitEvent),
 		killedCh:     make(chan struct{}),
 		sm:           sm,
 		increasingId: 0,
@@ -75,72 +75,37 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 	if !useRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
-	go rsm.eventLoop()
+	go rsm.applier()
 	return rsm
 }
 
-func (rsm *RSM) cancelAll() {
-	for _, ch := range rsm.indexToCh {
-		go func(ch chan any) {
-			close(ch)
-		}(ch)
-	}
-	clear(rsm.indexToCh)
-	clear(rsm.indexToId)
-}
-
-func (rsm *RSM) eventLoop() {
-	for {
-		select {
-		case msg, ok := <-rsm.applyCh:
-			if !ok {
-				select {
-				case <-rsm.killedCh:
-					// Is killed
-				default:
-					close(rsm.killedCh)
-					tester.Annotate(fmt.Sprintf("Server %v", rsm.me), "close", "close")
+func (rsm *RSM) applier() {
+	for msg := range rsm.applyCh {
+		index := msg.CommandIndex
+		op := msg.Command.(Op)
+		result := rsm.sm.DoOp(op.Command)
+		tester.Annotate(fmt.Sprintf("Server %v", rsm.me), "rsm apply", fmt.Sprintf("index: %v, id: %v", index, rsm.indexToId[index]))
+		rsm.mu.Lock()
+		ch, exists := rsm.indexToCh[index]
+		if exists {
+			if op.Me == rsm.me {
+				if op.Id != rsm.indexToId[index] {
+					panic("undefined behavior")
 				}
-				return
-			}
-			index := msg.CommandIndex
-			op := msg.Command.(Op)
-			result := rsm.sm.DoOp(op.Command)
-			ch, exists := rsm.indexToCh[index]
-			if exists {
-				if op.Me == rsm.me {
-					if op.Id != rsm.indexToId[index] {
-						panic("undefined behavior")
-					}
-					tester.Annotate(fmt.Sprintf("Server %v", rsm.me), "apply", fmt.Sprintf("index: %v, id: %v", index, rsm.indexToId[index]))
-					delete(rsm.indexToCh, index)
-					delete(rsm.indexToId, index)
-					go func() {
-						ch <- result
-					}()
-				} else {
-					tester.Annotate(fmt.Sprintf("Server %v", rsm.me), "cancel", fmt.Sprintf("index: %v, id: %v", index, rsm.indexToId[index]))
-					rsm.cancelAll()
-				}
-			}
-		case e := <-rsm.submitCh:
-			id := rsm.increasingId
-			rsm.increasingId++
-			op := Op{Me: rsm.me, Id: id, Command: e.req}
-			index, _, ok := rsm.rf.Start(op)
-			if !ok {
-				close(e.resultCh)
+				ch <- result
+				delete(rsm.indexToCh, index)
+				delete(rsm.indexToId, index)
 			} else {
-				tester.Annotate(fmt.Sprintf("Server %v", rsm.me), "submit", fmt.Sprintf("index: %v, id: %d", index, id))
-				ch, exists := rsm.indexToCh[index]
-				if exists {
+				for _, ch := range rsm.indexToCh {
 					close(ch)
 				}
-				rsm.indexToCh[index] = e.resultCh
-				rsm.indexToId[index] = id
+				clear(rsm.indexToCh)
+				clear(rsm.indexToId)
 			}
 		}
+		rsm.mu.Unlock()
 	}
+	close(rsm.killedCh)
 }
 
 func (rsm *RSM) Raft() raftapi.Raft {
@@ -151,26 +116,34 @@ func (rsm *RSM) Raft() raftapi.Raft {
 // should return ErrWrongLeader if client should find new leader and
 // try again.
 func (rsm *RSM) Submit(req any) (rpc.Err, any) {
-	ch := make(chan any, 1)
-	event := submitEvent{req, ch}
-	select {
-	case rsm.submitCh <- event:
-		// continue
-	case <-rsm.killedCh:
+	rsm.mu.Lock()
+	op := Op{Me: rsm.me, Id: rsm.increasingId, Command: req}
+	rsm.increasingId++
+	tester.Annotate(fmt.Sprintf("Server %v", rsm.me), fmt.Sprintf("rsm submit id: %v", op.Id), "")
+	index, _, ok := rsm.rf.Start(op)
+	if !ok {
+		rsm.mu.Unlock()
 		return rpc.ErrWrongLeader, nil
 	}
+	ch, exists := rsm.indexToCh[index]
+	if exists {
+		close(ch)
+	}
+	ch = make(chan any, 1)
+	rsm.indexToCh[index] = ch
+	rsm.indexToId[index] = op.Id
+	rsm.mu.Unlock()
 	select {
 	case result, ok := <-ch:
-		if !ok || result == nil {
+		tester.Annotate(fmt.Sprintf("Server %v", rsm.me), fmt.Sprintf("rsm receive result: %v", result), "")
+		if !ok {
 			return rpc.ErrWrongLeader, nil
 		}
 		return rpc.OK, result
 	case <-rsm.killedCh:
 		return rpc.ErrWrongLeader, nil
+	case <-time.After(time.Second):
+		tester.Annotate(fmt.Sprintf("Server %v", rsm.me), "rsm receive timeout", "")
+		return rpc.ErrWrongLeader, nil
 	}
-}
-
-type submitEvent struct {
-	req      any
-	resultCh chan any
 }
