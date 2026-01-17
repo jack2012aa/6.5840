@@ -1,6 +1,8 @@
 package kvraft
 
 import (
+	"fmt"
+	"sync"
 	"sync/atomic"
 
 	"6.5840/kvraft1/rsm"
@@ -10,12 +12,26 @@ import (
 	"6.5840/tester1"
 )
 
+type Entry struct {
+	Value   string
+	Version rpc.Tversion
+}
+
 type KVServer struct {
 	me   int
 	dead int32 // set by Kill()
 	rsm  *rsm.RSM
+	mu   sync.Mutex
+	db   map[string]Entry
+}
 
-	// Your definitions here.
+type PutRequest struct {
+	Key   string
+	Entry Entry
+}
+
+type GetRequest struct {
+	Key string
 }
 
 // To type-cast req to the right type, take a look at Go's type switches or type
@@ -24,7 +40,37 @@ type KVServer struct {
 // https://go.dev/tour/methods/16
 // https://go.dev/tour/methods/15
 func (kv *KVServer) DoOp(req any) any {
-	// Your code here
+	// Perform
+	// If the server is waiting for the request, reply to the channel
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	switch req.(type) {
+	case PutRequest:
+		putReq := req.(PutRequest)
+		if v, ok := kv.db[putReq.Key]; ok {
+			if v.Version != putReq.Entry.Version {
+				return rpc.PutReply{Err: rpc.ErrVersion}
+			}
+			putReq.Entry.Version++
+			kv.db[putReq.Key] = putReq.Entry
+			tester.Annotate(fmt.Sprintf("Server %v", kv.me), fmt.Sprintf("apply put %v", putReq.Entry), "")
+			return rpc.PutReply{Err: rpc.OK}
+		}
+		if putReq.Entry.Version != 0 {
+			return rpc.PutReply{Err: rpc.ErrVersion}
+		}
+		putReq.Entry.Version++
+		kv.db[putReq.Key] = putReq.Entry
+		tester.Annotate(fmt.Sprintf("Server %v", kv.me), fmt.Sprintf("apply put %v", putReq.Entry), "")
+		return rpc.PutReply{Err: rpc.OK}
+	case GetRequest:
+		getReq := req.(GetRequest)
+		entry, ok := kv.db[getReq.Key]
+		if !ok {
+			return rpc.GetReply{Err: rpc.ErrNoKey}
+		}
+		return rpc.GetReply{Value: entry.Value, Version: entry.Version, Err: rpc.OK}
+	}
 	return nil
 }
 
@@ -41,12 +87,29 @@ func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
 	// Your code here. Use kv.rsm.Submit() to submit args
 	// You can use go's type casts to turn the any return value
 	// of Submit() into a GetReply: rep.(rpc.GetReply)
+	req := GetRequest{args.Key}
+	err, result := kv.rsm.Submit(req)
+	if err != rpc.OK {
+		reply.Err = rpc.ErrWrongLeader
+	} else {
+		reply.Err = result.(rpc.GetReply).Err
+		reply.Value = result.(rpc.GetReply).Value
+		reply.Version = result.(rpc.GetReply).Version
+	}
 }
 
 func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
 	// Your code here. Use kv.rsm.Submit() to submit args
 	// You can use go's type casts to turn the any return value
 	// of Submit() into a PutReply: rep.(rpc.PutReply)
+	req := PutRequest{Key: args.Key, Entry: Entry{Value: args.Value, Version: args.Version}}
+	tester.Annotate(fmt.Sprintf("Server %v", kv.me), fmt.Sprintf("try put key: %v, value: %v, version: %v", args.Key, args.Value, args.Version), "")
+	err, result := kv.rsm.Submit(req)
+	if err != rpc.OK {
+		reply.Err = rpc.ErrWrongLeader
+	} else {
+		reply.Err = result.(rpc.PutReply).Err
+	}
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -75,8 +138,10 @@ func StartKVServer(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, persist
 	labgob.Register(rsm.Op{})
 	labgob.Register(rpc.PutArgs{})
 	labgob.Register(rpc.GetArgs{})
+	labgob.Register(PutRequest{})
+	labgob.Register(GetRequest{})
 
-	kv := &KVServer{me: me}
+	kv := &KVServer{me: me, mu: sync.Mutex{}, db: make(map[string]Entry)}
 
 	kv.rsm = rsm.MakeRSM(servers, me, persister, maxraftstate, kv)
 	// You may need initialization code here.
