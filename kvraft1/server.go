@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -70,17 +71,39 @@ func (kv *KVServer) DoOp(req any) any {
 			return rpc.GetReply{Err: rpc.ErrNoKey}
 		}
 		return rpc.GetReply{Value: entry.Value, Version: entry.Version, Err: rpc.OK}
+	default:
+		fmt.Printf("Unknown req %v", req)
+		panic("unknown req type")
 	}
 	return nil
 }
 
 func (kv *KVServer) Snapshot() []byte {
-	// Your code here
-	return nil
+	buf := new(bytes.Buffer)
+	enc := labgob.NewEncoder(buf)
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	err := enc.Encode(kv.db)
+	if err != nil {
+		panic(err)
+	}
+	return buf.Bytes()
 }
 
 func (kv *KVServer) Restore(data []byte) {
-	// Your code here
+	if len(data) == 0 {
+		return
+	}
+	buf := bytes.NewBuffer(data)
+	dec := labgob.NewDecoder(buf)
+	var db map[string]Entry
+	err := dec.Decode(&db)
+	if err != nil {
+		panic(err)
+	}
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	kv.db = db
 }
 
 func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
@@ -140,8 +163,14 @@ func StartKVServer(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, persist
 	labgob.Register(rpc.GetArgs{})
 	labgob.Register(PutRequest{})
 	labgob.Register(GetRequest{})
+	labgob.Register(Entry{})
+	var buf []byte
+	labgob.Register(buf)
+	db := make(map[string]Entry)
+	labgob.Register(db)
+	labgob.Register(1)
 
-	kv := &KVServer{me: me, mu: sync.Mutex{}, db: make(map[string]Entry)}
+	kv := &KVServer{me: me, mu: sync.Mutex{}, db: db}
 
 	kv.rsm = rsm.MakeRSM(servers, me, persister, maxraftstate, kv)
 	// You may need initialization code here.

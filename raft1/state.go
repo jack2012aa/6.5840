@@ -48,6 +48,7 @@ func handleSnapshotEvent(r *Raft, e raftEvent) {
 		panic(fmt.Sprintf("snapshot index out of range: %v", se.index))
 	}
 	if se.index <= r.snapshot.LastIndex {
+		close(se.done)
 		return
 	}
 	i := se.index - r.logs[0].Index
@@ -190,27 +191,29 @@ func tryCommit(r *Raft, last int) {
 	if last <= r.commitIndex {
 		return
 	}
-	i := last - r.logs[0].Index
-	if i < 0 || r.logs[i].Term != r.currentTerm {
-		return
-	}
-	majority := len(r.peers) / 2
-	matches := 0
-	for _, i := range r.matchIndex {
-		if i >= last {
-			matches++
+	for j := r.commitIndex + 1; j <= last; j++ {
+		i := j - r.logs[0].Index
+		if i < 0 || r.logs[i].Term != r.currentTerm {
+			continue
 		}
-		if matches > majority {
-			break
+		majority := len(r.peers) / 2
+		matches := 0
+		for _, i := range r.matchIndex {
+			if i >= j {
+				matches++
+			}
+			if matches > majority {
+				break
+			}
 		}
+		if matches <= majority {
+			return
+		}
+		tester.Annotate(fmt.Sprintf("Server %v", r.me),
+			"commits",
+			fmt.Sprintf("commits left: %v, right: %v", r.commitIndex, last))
+		r.commitIndex = j
 	}
-	if matches <= majority {
-		return
-	}
-	tester.Annotate(fmt.Sprintf("Server %v", r.me),
-		"commits",
-		fmt.Sprintf("commits left: %v, right: %v", r.commitIndex, last))
-	r.commitIndex = last
 }
 
 func leaderHandleAppendEntriesReply(r *Raft, e raftEvent) {
