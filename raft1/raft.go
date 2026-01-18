@@ -178,6 +178,19 @@ func (r *Raft) readPersist(data []byte) {
 		r.votedFor = votedFor
 		r.logs = logs
 		r.snapshot = Snapshot{data, sIdx, sTerm}
+		if len(data) > 0 {
+			r.commitIndex = sIdx
+			msg := raftapi.ApplyMsg{
+				CommandValid:  false,
+				SnapshotValid: true,
+				Snapshot:      data,
+				SnapshotIndex: sIdx,
+				SnapshotTerm:  sTerm,
+			}
+			go func() {
+				r.applyCh <- msg
+			}()
+		}
 	}
 }
 

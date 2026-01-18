@@ -32,17 +32,25 @@ type StateMachine interface {
 	Restore([]byte)
 }
 
+type waitingEntry struct {
+	ch    chan any
+	index int
+	id    int
+}
+
 type RSM struct {
-	mu           sync.Mutex
-	me           int
-	rf           raftapi.Raft
-	applyCh      chan raftapi.ApplyMsg
-	killedCh     chan struct{}
-	maxraftstate int // snapshot if log grows this big
-	sm           StateMachine
-	increasingId int
-	indexToCh    map[int]chan any
-	indexToId    map[int]int
+	mu             sync.Mutex
+	me             int
+	rf             raftapi.Raft
+	applyCh        chan raftapi.ApplyMsg
+	killedCh       chan struct{}
+	maxraftstate   int // snapshot if log grows this big
+	sm             StateMachine
+	increasingId   int
+	waitingIndices map[int]waitingEntry
+	persister      *tester.Persister
+	lastApplied    int
+	snapshotCh     chan struct{}
 }
 
 // servers[] contains the ports of the set of
@@ -62,48 +70,67 @@ type RSM struct {
 // any long-running work.
 func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, maxraftstate int, sm StateMachine) *RSM {
 	rsm := &RSM{
-		me:           me,
-		mu:           sync.Mutex{},
-		maxraftstate: maxraftstate,
-		applyCh:      make(chan raftapi.ApplyMsg),
-		killedCh:     make(chan struct{}),
-		sm:           sm,
-		increasingId: 0,
-		indexToCh:    make(map[int]chan any),
-		indexToId:    make(map[int]int),
+		me:             me,
+		mu:             sync.Mutex{},
+		maxraftstate:   maxraftstate,
+		applyCh:        make(chan raftapi.ApplyMsg),
+		killedCh:       make(chan struct{}),
+		sm:             sm,
+		increasingId:   0,
+		waitingIndices: make(map[int]waitingEntry),
+		persister:      persister,
+		snapshotCh:     make(chan struct{}),
 	}
 	if !useRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
 	go rsm.applier()
+	go rsm.SnapshotChecker()
 	return rsm
 }
 
 func (rsm *RSM) applier() {
 	for msg := range rsm.applyCh {
-		index := msg.CommandIndex
-		op := msg.Command.(Op)
-		result := rsm.sm.DoOp(op.Command)
-		tester.Annotate(fmt.Sprintf("Server %v", rsm.me), "rsm apply", fmt.Sprintf("index: %v, id: %v", index, rsm.indexToId[index]))
-		rsm.mu.Lock()
-		ch, exists := rsm.indexToCh[index]
-		if exists {
-			if op.Me == rsm.me {
-				if op.Id != rsm.indexToId[index] {
-					panic("undefined behavior")
+		if msg.CommandValid {
+			index := msg.CommandIndex
+			op := msg.Command.(Op)
+			result := rsm.sm.DoOp(op.Command)
+			tester.Annotate(fmt.Sprintf("Server %v", rsm.me), fmt.Sprintf("rsm apply index: %v", index), "")
+			rsm.mu.Lock()
+			rsm.lastApplied = msg.CommandIndex
+			entry, ok := rsm.waitingIndices[index]
+			if ok {
+				if op.Me == rsm.me {
+					if op.Id != entry.id {
+						panic("undefined behavior")
+					}
+					entry.ch <- result
+				} else {
+					close(entry.ch)
 				}
-				ch <- result
-				delete(rsm.indexToCh, index)
-				delete(rsm.indexToId, index)
-			} else {
-				for _, ch := range rsm.indexToCh {
-					close(ch)
-				}
-				clear(rsm.indexToCh)
-				clear(rsm.indexToId)
+				delete(rsm.waitingIndices, index)
 			}
+			rsm.mu.Unlock()
+		} else {
+			s := msg.Snapshot
+			rsm.sm.Restore(s)
+			tester.Annotate(fmt.Sprintf("Server %v", rsm.me), fmt.Sprintf("rsm apply snapshot index: %v", msg.SnapshotIndex), "")
+			rsm.mu.Lock()
+			rsm.lastApplied = msg.SnapshotIndex
+			for i, entry := range rsm.waitingIndices {
+				if i <= msg.SnapshotIndex {
+					close(entry.ch)
+					delete(rsm.waitingIndices, i)
+				}
+			}
+			rsm.mu.Unlock()
 		}
-		rsm.mu.Unlock()
+		go func() {
+			select {
+			case rsm.snapshotCh <- struct{}{}:
+			case <-rsm.killedCh:
+			}
+		}()
 	}
 	close(rsm.killedCh)
 }
@@ -112,11 +139,35 @@ func (rsm *RSM) Raft() raftapi.Raft {
 	return rsm.rf
 }
 
+func (rsm *RSM) SnapshotChecker() {
+	for {
+		select {
+		case <-rsm.snapshotCh:
+			size := rsm.rf.PersistBytes()
+			rsm.mu.Lock()
+			if rsm.maxraftstate != -1 && size >= rsm.maxraftstate {
+				tester.Annotate(fmt.Sprintf("Server %v", rsm.me), fmt.Sprintf("rsm snapshot size: %v", size), "")
+				s := rsm.sm.Snapshot()
+				rsm.rf.Snapshot(rsm.lastApplied, s)
+			}
+			rsm.mu.Unlock()
+		case <-rsm.killedCh:
+			return
+		}
+	}
+}
+
 // Submit a command to Raft, and wait for it to be committed.  It
 // should return ErrWrongLeader if client should find new leader and
 // try again.
 func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	rsm.mu.Lock()
+	go func() {
+		select {
+		case rsm.snapshotCh <- struct{}{}:
+		case <-rsm.killedCh:
+		}
+	}()
 	op := Op{Me: rsm.me, Id: rsm.increasingId, Command: req}
 	rsm.increasingId++
 	tester.Annotate(fmt.Sprintf("Server %v", rsm.me), fmt.Sprintf("rsm submit id: %v", op.Id), "")
@@ -125,13 +176,12 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 		rsm.mu.Unlock()
 		return rpc.ErrWrongLeader, nil
 	}
-	ch, exists := rsm.indexToCh[index]
+	entry, exists := rsm.waitingIndices[index]
 	if exists {
-		close(ch)
+		close(entry.ch)
 	}
-	ch = make(chan any, 1)
-	rsm.indexToCh[index] = ch
-	rsm.indexToId[index] = op.Id
+	ch := make(chan any, 1)
+	rsm.waitingIndices[index] = waitingEntry{ch: ch, index: index, id: op.Id}
 	rsm.mu.Unlock()
 	select {
 	case result, ok := <-ch:
@@ -142,8 +192,11 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 		return rpc.OK, result
 	case <-rsm.killedCh:
 		return rpc.ErrWrongLeader, nil
-	case <-time.After(time.Second):
+	case <-time.After(500 * time.Millisecond):
 		tester.Annotate(fmt.Sprintf("Server %v", rsm.me), "rsm receive timeout", "")
+		rsm.mu.Lock()
+		delete(rsm.waitingIndices, index)
+		rsm.mu.Unlock()
 		return rpc.ErrWrongLeader, nil
 	}
 }
