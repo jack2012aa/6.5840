@@ -10,6 +10,7 @@ import (
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labgob"
 	"6.5840/labrpc"
+	"6.5840/shardkv1/shardcfg"
 	"6.5840/shardkv1/shardgrp/shardrpc"
 	"6.5840/tester1"
 )
@@ -28,13 +29,32 @@ type GetRequest struct {
 	Key string
 }
 
+type FreezeRequest struct {
+	Shard shardcfg.Tshid
+	Num   shardcfg.Tnum
+}
+
+type InstallShardRequest struct {
+	Shard shardcfg.Tshid
+	Num   shardcfg.Tnum
+	State []byte
+}
+
+type DeleteShardRequest struct {
+	Shard shardcfg.Tshid
+	Num   shardcfg.Tnum
+}
+
 type KVServer struct {
-	me   int
-	dead int32 // set by Kill()
-	rsm  *rsm.RSM
-	gid  tester.Tgid
-	mu   sync.Mutex
-	db   map[string]Entry
+	me         int
+	dead       int32 // set by Kill()
+	rsm        *rsm.RSM
+	gid        tester.Tgid
+	mu         sync.Mutex
+	db         map[string]Entry
+	configNum  shardcfg.Tnum
+	frozenKeys map[string]bool
+	shards     map[shardcfg.Tshid]bool
 }
 
 func (kv *KVServer) DoOp(req any) any {
@@ -45,6 +65,10 @@ func (kv *KVServer) DoOp(req any) any {
 	switch req.(type) {
 	case PutRequest:
 		putReq := req.(PutRequest)
+		shard := shardcfg.Key2Shard(putReq.Key)
+		if !kv.shards[shard] || kv.frozenKeys[putReq.Key] {
+			return rpc.PutReply{Err: rpc.ErrWrongGroup}
+		}
 		if v, ok := kv.db[putReq.Key]; ok {
 			if v.Version != putReq.Entry.Version {
 				return rpc.PutReply{Err: rpc.ErrVersion}
@@ -63,11 +87,75 @@ func (kv *KVServer) DoOp(req any) any {
 		return rpc.PutReply{Err: rpc.OK}
 	case GetRequest:
 		getReq := req.(GetRequest)
+		shard := shardcfg.Key2Shard(getReq.Key)
+		if !kv.shards[shard] || kv.frozenKeys[getReq.Key] {
+			return rpc.GetReply{Err: rpc.ErrWrongGroup}
+		}
 		entry, ok := kv.db[getReq.Key]
 		if !ok {
 			return rpc.GetReply{Err: rpc.ErrNoKey}
 		}
 		return rpc.GetReply{Value: entry.Value, Version: entry.Version, Err: rpc.OK}
+	case FreezeRequest:
+		freezeReq := req.(FreezeRequest)
+		if freezeReq.Num < kv.configNum || freezeReq.Num > kv.configNum+1 {
+			return shardrpc.FreezeShardReply{Num: kv.configNum, Err: rpc.ErrVersion}
+		}
+		if !kv.shards[freezeReq.Shard] {
+			return shardrpc.FreezeShardReply{Num: kv.configNum + 1, Err: rpc.ErrWrongGroup}
+		}
+		fmt.Printf("Server %v-%v froze shard: %v\n", kv.gid, kv.me, freezeReq.Shard)
+		kv.configNum = freezeReq.Num
+		state := make(map[string]Entry)
+		for k, v := range kv.db {
+			shard := shardcfg.Key2Shard(k)
+			if !kv.frozenKeys[k] && shard == freezeReq.Shard {
+				kv.frozenKeys[k] = true
+				state[k] = v
+			}
+		}
+		buf := new(bytes.Buffer)
+		enc := labgob.NewEncoder(buf)
+		err := enc.Encode(state)
+		if err != nil {
+			panic(err)
+		}
+		return shardrpc.FreezeShardReply{Num: kv.configNum, Err: rpc.OK, State: buf.Bytes()}
+	case InstallShardRequest:
+		installShardReq := req.(InstallShardRequest)
+		if installShardReq.Num < kv.configNum || installShardReq.Num > kv.configNum+1 {
+			return shardrpc.InstallShardReply{Err: rpc.ErrVersion}
+		}
+		fmt.Printf("Server %v-%v installed shard: %v\n", kv.gid, kv.me, installShardReq.Shard)
+		kv.shards[installShardReq.Shard] = true
+		kv.configNum = installShardReq.Num
+		buf := bytes.NewBuffer(installShardReq.State)
+		dec := labgob.NewDecoder(buf)
+		var s map[string]Entry
+		err := dec.Decode(&s)
+		if err != nil {
+			panic(err)
+		}
+		for k, v := range s {
+			kv.db[k] = v
+		}
+		return shardrpc.InstallShardReply{Err: rpc.OK}
+	case DeleteShardRequest:
+		deleteShardReq := req.(DeleteShardRequest)
+		if deleteShardReq.Num != kv.configNum {
+			return shardrpc.DeleteShardReply{Err: rpc.ErrVersion}
+		}
+		if !kv.shards[deleteShardReq.Shard] {
+			return shardrpc.DeleteShardReply{Err: rpc.ErrWrongGroup}
+		}
+		fmt.Printf("Server %v-%v deleted shard: %v\n", kv.gid, kv.me, deleteShardReq.Shard)
+		for k, _ := range kv.frozenKeys {
+			if shardcfg.Key2Shard(k) == deleteShardReq.Shard {
+				delete(kv.frozenKeys, k)
+				delete(kv.db, k)
+			}
+		}
+		return shardrpc.DeleteShardReply{Err: rpc.OK}
 	default:
 		fmt.Printf("Unknown req %v", req)
 		panic("unknown req type")
@@ -153,17 +241,41 @@ func (kv *KVServer) killed() bool {
 // Freeze the specified shard (i.e., reject future Get/Puts for this
 // shard) and return the key/values stored in that shard.
 func (kv *KVServer) FreezeShard(args *shardrpc.FreezeShardArgs, reply *shardrpc.FreezeShardReply) {
-	// Your code here
+	req := FreezeRequest{Shard: args.Shard, Num: args.Num}
+	tester.Annotate(fmt.Sprintf("Server %v", kv.me), fmt.Sprintf("try freeze shard: %v, num: %v", args.Shard, args.Num), "")
+	err, result := kv.rsm.Submit(req)
+	if err != rpc.OK {
+		reply.Err = rpc.ErrWrongLeader
+	} else {
+		r := result.(shardrpc.FreezeShardReply)
+		reply.Err = r.Err
+		reply.Num = r.Num
+		reply.State = r.State
+	}
 }
 
 // Install the supplied state for the specified shard.
 func (kv *KVServer) InstallShard(args *shardrpc.InstallShardArgs, reply *shardrpc.InstallShardReply) {
-	// Your code here
+	req := InstallShardRequest{Shard: args.Shard, Num: args.Num, State: args.State}
+	tester.Annotate(fmt.Sprintf("Server %v", kv.me), fmt.Sprintf("try install shard: %v, num: %v", args.Shard, args.Num), "")
+	err, result := kv.rsm.Submit(req)
+	if err != rpc.OK {
+		reply.Err = rpc.ErrWrongLeader
+	} else {
+		reply.Err = result.(shardrpc.InstallShardReply).Err
+	}
 }
 
 // Delete the specified shard.
 func (kv *KVServer) DeleteShard(args *shardrpc.DeleteShardArgs, reply *shardrpc.DeleteShardReply) {
-	// Your code here
+	req := DeleteShardRequest{Shard: args.Shard, Num: args.Num}
+	tester.Annotate(fmt.Sprintf("Server %v", kv.me), fmt.Sprintf("try delete shard: %v, num: %v", args.Shard, args.Num), "")
+	err, result := kv.rsm.Submit(req)
+	if err != rpc.OK {
+		reply.Err = rpc.ErrWrongLeader
+	} else {
+		reply.Err = result.(shardrpc.DeleteShardReply).Err
+	}
 }
 
 // StartShardServerGrp starts a server for shardgrp `gid`.
@@ -176,15 +288,28 @@ func StartServerShardGrp(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, p
 	labgob.Register(rpc.PutArgs{})
 	labgob.Register(rpc.GetArgs{})
 	labgob.Register(shardrpc.FreezeShardArgs{})
+	labgob.Register(shardrpc.FreezeShardReply{})
 	labgob.Register(shardrpc.InstallShardArgs{})
+	labgob.Register(shardrpc.InstallShardReply{})
 	labgob.Register(shardrpc.DeleteShardArgs{})
+	labgob.Register(shardrpc.DeleteShardReply{})
 	labgob.Register(rsm.Op{})
 	labgob.Register(PutRequest{})
 	labgob.Register(GetRequest{})
 	labgob.Register(Entry{})
+	labgob.Register(FreezeRequest{})
+	labgob.Register(InstallShardRequest{})
+	labgob.Register(DeleteShardRequest{})
 
-	kv := &KVServer{gid: gid, me: me, db: make(map[string]Entry)}
+	kv := &KVServer{gid: gid, me: me, db: make(map[string]Entry), configNum: 1}
 	kv.rsm = rsm.MakeRSM(servers, me, persister, maxraftstate, kv)
+	kv.frozenKeys = make(map[string]bool)
+	kv.shards = make(map[shardcfg.Tshid]bool)
+	if gid == shardcfg.Gid1 {
+		for i := 0; i < shardcfg.NShards; i++ {
+			kv.shards[shardcfg.Tshid(i)] = true
+		}
+	}
 
 	return []tester.IService{kv, kv.rsm.Raft()}
 }
