@@ -1,8 +1,8 @@
 package shardgrp
 
 import (
-	"fmt"
 	"sync"
+	"time"
 
 	"6.5840/kvsrv1/rpc"
 	kvtest "6.5840/kvtest1"
@@ -35,22 +35,23 @@ func MakeClerk(clnt *tester.Clnt, servers []string) kvtest.IKVClerk {
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 	args := &rpc.GetArgs{Key: key}
-	reply := &rpc.GetReply{}
 	ck.mu.Lock()
 	target := ck.leader
 	ck.mu.Unlock()
-	for {
-		tester.Annotate("Client", "try get", fmt.Sprintf("to %v", target))
-		ok := ck.clnt.Call(ck.servers[ck.leader], "KVServer.Get", args, reply)
+	for i := 0; i < 100; i++ {
+		reply := &rpc.GetReply{}
+		ok := ck.clnt.Call(ck.servers[target], "KVServer.Get", args, reply)
+		//fmt.Println("Shard group gets:", key, ok, *reply)
 		if ok && reply.Err != rpc.ErrWrongLeader {
-			break
+			return reply.Value, reply.Version, reply.Err
 		}
 		ck.mu.Lock()
 		ck.leader = (ck.leader + 1) % len(ck.servers)
 		target = ck.leader
 		ck.mu.Unlock()
+		time.Sleep(10 * time.Millisecond)
 	}
-	return reply.Value, reply.Version, reply.Err
+	return "", 0, rpc.ErrWrongGroup
 }
 
 // Put updates key with value only if the version in the
@@ -72,43 +73,47 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 	args := &rpc.PutArgs{Key: key, Value: value, Version: version}
-	reply := &rpc.PutReply{}
 	retry := false
 	ck.mu.Lock()
 	target := ck.leader
 	ck.mu.Unlock()
-	for {
-		tester.Annotate("Client", fmt.Sprintf("try put to %v", target), "")
+	for i := 0; i < 100; i++ {
+		reply := &rpc.PutReply{}
 		ok := ck.clnt.Call(ck.servers[target], "KVServer.Put", args, reply)
+		//fmt.Println("Shard group puts:", key, value, version, ok, reply.Err)
 		if ok {
 			switch reply.Err {
 			case rpc.ErrNoKey, rpc.OK:
-				tester.Annotate("Client", fmt.Sprintf("result: %v", reply.Err), "")
 				return reply.Err
-			case rpc.ErrVersion:
+			case rpc.ErrVersion, rpc.ErrMaybe:
 				if retry {
-					tester.Annotate("Client", fmt.Sprintf("try put to %v", rpc.ErrMaybe), "")
 					return rpc.ErrMaybe
 				}
-				tester.Annotate("Client", fmt.Sprintf("try put to %v", rpc.ErrVersion), "")
-				return rpc.ErrVersion
+				return reply.Err
 			}
+		} else {
+			retry = true
 		}
 		ck.mu.Lock()
 		ck.leader = (ck.leader + 1) % len(ck.servers)
 		target = ck.leader
 		ck.mu.Unlock()
-		retry = true
+		time.Sleep(10 * time.Millisecond)
 	}
+	if retry {
+		return rpc.ErrMaybe
+	}
+
+	return rpc.ErrWrongGroup
 }
 
 func (ck *Clerk) FreezeShard(s shardcfg.Tshid, num shardcfg.Tnum) ([]byte, rpc.Err) {
 	args := &shardrpc.FreezeShardArgs{Shard: s, Num: num}
-	reply := &shardrpc.FreezeShardReply{}
 	ck.mu.Lock()
 	target := ck.leader
 	ck.mu.Unlock()
 	for {
+		reply := &shardrpc.FreezeShardReply{}
 		ok := ck.clnt.Call(ck.servers[target], "KVServer.FreezeShard", args, reply)
 		if ok && reply.Err == rpc.OK {
 			return reply.State, reply.Err
@@ -122,11 +127,11 @@ func (ck *Clerk) FreezeShard(s shardcfg.Tshid, num shardcfg.Tnum) ([]byte, rpc.E
 
 func (ck *Clerk) InstallShard(s shardcfg.Tshid, state []byte, num shardcfg.Tnum) rpc.Err {
 	args := &shardrpc.InstallShardArgs{Shard: s, State: state, Num: num}
-	reply := &shardrpc.InstallShardReply{}
 	ck.mu.Lock()
 	target := ck.leader
 	ck.mu.Unlock()
 	for {
+		reply := &shardrpc.InstallShardReply{}
 		ok := ck.clnt.Call(ck.servers[target], "KVServer.InstallShard", args, reply)
 		if ok && reply.Err == rpc.OK {
 			return rpc.OK
@@ -140,11 +145,11 @@ func (ck *Clerk) InstallShard(s shardcfg.Tshid, state []byte, num shardcfg.Tnum)
 
 func (ck *Clerk) DeleteShard(s shardcfg.Tshid, num shardcfg.Tnum) rpc.Err {
 	args := &shardrpc.DeleteShardArgs{Shard: s, Num: num}
-	reply := &shardrpc.DeleteShardReply{}
 	ck.mu.Lock()
 	target := ck.leader
 	ck.mu.Unlock()
 	for {
+		reply := &shardrpc.DeleteShardReply{}
 		ok := ck.clnt.Call(ck.servers[target], "KVServer.DeleteShard", args, reply)
 		if ok && reply.Err == rpc.OK {
 			return rpc.OK

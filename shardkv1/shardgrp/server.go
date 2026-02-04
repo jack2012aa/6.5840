@@ -75,7 +75,6 @@ func (kv *KVServer) DoOp(req any) any {
 			}
 			putReq.Entry.Version++
 			kv.db[putReq.Key] = putReq.Entry
-			tester.Annotate(fmt.Sprintf("Server %v", kv.me), fmt.Sprintf("apply put %v", putReq.Entry), "")
 			return rpc.PutReply{Err: rpc.OK}
 		}
 		if putReq.Entry.Version != 0 {
@@ -83,7 +82,6 @@ func (kv *KVServer) DoOp(req any) any {
 		}
 		putReq.Entry.Version++
 		kv.db[putReq.Key] = putReq.Entry
-		tester.Annotate(fmt.Sprintf("Server %v", kv.me), fmt.Sprintf("apply put %v", putReq.Entry), "")
 		return rpc.PutReply{Err: rpc.OK}
 	case GetRequest:
 		getReq := req.(GetRequest)
@@ -98,18 +96,18 @@ func (kv *KVServer) DoOp(req any) any {
 		return rpc.GetReply{Value: entry.Value, Version: entry.Version, Err: rpc.OK}
 	case FreezeRequest:
 		freezeReq := req.(FreezeRequest)
-		if freezeReq.Num < kv.configNum || freezeReq.Num > kv.configNum+1 {
+		if freezeReq.Num < kv.configNum {
 			return shardrpc.FreezeShardReply{Num: kv.configNum, Err: rpc.ErrVersion}
 		}
 		if !kv.shards[freezeReq.Shard] {
 			return shardrpc.FreezeShardReply{Num: kv.configNum + 1, Err: rpc.ErrWrongGroup}
 		}
-		fmt.Printf("Server %v-%v froze shard: %v\n", kv.gid, kv.me, freezeReq.Shard)
+		//fmt.Printf("Server %v-%v froze shard: %v\n", kv.gid, kv.me, freezeReq.Shard)
 		kv.configNum = freezeReq.Num
 		state := make(map[string]Entry)
 		for k, v := range kv.db {
 			shard := shardcfg.Key2Shard(k)
-			if !kv.frozenKeys[k] && shard == freezeReq.Shard {
+			if shard == freezeReq.Shard {
 				kv.frozenKeys[k] = true
 				state[k] = v
 			}
@@ -123,10 +121,10 @@ func (kv *KVServer) DoOp(req any) any {
 		return shardrpc.FreezeShardReply{Num: kv.configNum, Err: rpc.OK, State: buf.Bytes()}
 	case InstallShardRequest:
 		installShardReq := req.(InstallShardRequest)
-		if installShardReq.Num < kv.configNum || installShardReq.Num > kv.configNum+1 {
+		if installShardReq.Num < kv.configNum {
 			return shardrpc.InstallShardReply{Err: rpc.ErrVersion}
 		}
-		fmt.Printf("Server %v-%v installed shard: %v\n", kv.gid, kv.me, installShardReq.Shard)
+		//fmt.Printf("Server %v-%v installed shard: %v\n", kv.gid, kv.me, installShardReq.Shard)
 		kv.shards[installShardReq.Shard] = true
 		kv.configNum = installShardReq.Num
 		buf := bytes.NewBuffer(installShardReq.State)
@@ -145,19 +143,17 @@ func (kv *KVServer) DoOp(req any) any {
 		if deleteShardReq.Num != kv.configNum {
 			return shardrpc.DeleteShardReply{Err: rpc.ErrVersion}
 		}
-		if !kv.shards[deleteShardReq.Shard] {
-			return shardrpc.DeleteShardReply{Err: rpc.ErrWrongGroup}
-		}
-		fmt.Printf("Server %v-%v deleted shard: %v\n", kv.gid, kv.me, deleteShardReq.Shard)
+		//fmt.Printf("Server %v-%v deleted shard: %v\n", kv.gid, kv.me, deleteShardReq.Shard)
 		for k, _ := range kv.frozenKeys {
 			if shardcfg.Key2Shard(k) == deleteShardReq.Shard {
 				delete(kv.frozenKeys, k)
 				delete(kv.db, k)
 			}
 		}
+		delete(kv.shards, deleteShardReq.Shard)
 		return shardrpc.DeleteShardReply{Err: rpc.OK}
 	default:
-		fmt.Printf("Unknown req %v", req)
+		//fmt.Printf("Unknown req %v", req)
 		panic("unknown req type")
 	}
 	return nil
@@ -217,6 +213,9 @@ func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
 		reply.Err = rpc.ErrWrongLeader
 	} else {
 		reply.Err = result.(rpc.PutReply).Err
+		if reply.Err == rpc.OK {
+			//fmt.Printf("Server %v-%v puts %v\n", kv.gid, kv.me, *args)
+		}
 	}
 }
 
@@ -230,7 +229,6 @@ func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
 // to suppress debug output from a Kill()ed instance.
 func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
-	// Your code here, if desired.
 }
 
 func (kv *KVServer) killed() bool {

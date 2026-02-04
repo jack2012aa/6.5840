@@ -9,6 +9,8 @@ package shardkv
 //
 
 import (
+	"time"
+
 	"6.5840/kvsrv1/rpc"
 	"6.5840/kvtest1"
 	"6.5840/shardkv1/shardcfg"
@@ -20,7 +22,7 @@ import (
 type Clerk struct {
 	clnt *tester.Clnt
 	sck  *shardctrler.ShardCtrler
-	// You will have to modify this struct.
+	cks  map[tester.Tgid]kvtest.IKVClerk
 }
 
 // The tester calls MakeClerk and passes in a shardctrler so that
@@ -29,16 +31,22 @@ func MakeClerk(clnt *tester.Clnt, sck *shardctrler.ShardCtrler) kvtest.IKVClerk 
 	ck := &Clerk{
 		clnt: clnt,
 		sck:  sck,
+		cks:  make(map[tester.Tgid]kvtest.IKVClerk),
 	}
 	// You'll have to add code here.
 	return ck
 }
 
-func (ck *Clerk) serversOf(key string) []string {
+func (ck *Clerk) ckOf(key string) kvtest.IKVClerk {
 	sh := shardcfg.Key2Shard(key)
 	cfg := ck.sck.Query()
-	_, servers, _ := cfg.GidServers(sh)
-	return servers
+	gid := cfg.Shards[sh]
+	if ck.cks[gid] == nil {
+		_, servers, _ := cfg.GidServers(sh)
+		c := shardgrp.MakeClerk(ck.clnt, servers)
+		ck.cks[gid] = c
+	}
+	return ck.cks[gid]
 }
 
 // Get a key from a shardgrp.  You can use shardcfg.Key2Shard(key) to
@@ -47,14 +55,27 @@ func (ck *Clerk) serversOf(key string) []string {
 // responsible for key.  You can make a clerk for that group by
 // calling shardgrp.MakeClerk(ck.clnt, servers).
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
-	servers := ck.serversOf(key)
-	shardgrpCk := shardgrp.MakeClerk(ck.clnt, servers)
-	return shardgrpCk.Get(key)
+	for {
+		//fmt.Printf("Get key: %v, shard: %v in servers %v\n", key, shardcfg.Key2Shard(key), servers)
+		shardgrpCk := ck.ckOf(key)
+		val, v, err := shardgrpCk.Get(key)
+		if err != rpc.ErrWrongGroup {
+			return val, v, err
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
 }
 
 // Put a key to a shard group.
 func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
-	servers := ck.serversOf(key)
-	shardgrpCk := shardgrp.MakeClerk(ck.clnt, servers)
-	return shardgrpCk.Put(key, value, version)
+	for {
+		shardgrpCk := ck.ckOf(key)
+		err := shardgrpCk.Put(key, value, version)
+		//fmt.Println("Put:", key, servers, err)
+		if err != rpc.ErrWrongGroup {
+			return err
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
 }

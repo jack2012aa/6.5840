@@ -5,7 +5,6 @@ package shardctrler
 //
 
 import (
-	"fmt"
 	"sync"
 
 	"6.5840/kvsrv1"
@@ -62,7 +61,7 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 	// Freeze
 	for i := 0; i < shardcfg.NShards; i++ {
 		if oldCfg.Shards[i] != new.Shards[i] {
-			fmt.Printf("Moving shard %v from %v to %v\n", i, oldCfg.Shards[i], new.Shards[i])
+			//fmt.Printf("Moving shard %v from %v to %v\n", i, oldCfg.Shards[i], new.Shards[i])
 			freeze.Add(1)
 			go func(i int) {
 				servers := oldCfg.Groups[oldCfg.Shards[i]]
